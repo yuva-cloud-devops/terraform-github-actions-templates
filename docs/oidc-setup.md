@@ -6,24 +6,25 @@ These centralized pipelines use **short-lived OIDC tokens**—never static cloud
 
 ## 1. Required GitHub Workflow Permissions
 
-Both the consumer workflow (`ci.yml` / `cd.yml`) and the reusable workflows require `id-token: write` to mint the OIDC JWT:
+Both the consumer workflow (`.github/workflows/terraform.yml`) and the centralized reusable workflow (`terraform-pipeline.yml`) require `id-token: write` to mint the OIDC JWT:
 
 ```yaml
 permissions:
-  id-token: write   # Allows GitHub to mint the short-lived OIDC JWT
-  contents: read    # Required to checkout the repository
+  id-token: write      # Allows GitHub to mint the short-lived OIDC JWT
+  contents: read       # Required to checkout the repository
+  pull-requests: write # Required for the CI Bot to post PR comments
 ```
 
-The centralized auth modules in `pipelines/common/auth/` handle login automatically based on `cloud_provider`:
-- **GCP** (`pipelines/common/auth/gcp/action.yml`): `google-github-actions/auth@v2`
-- **AWS** (`pipelines/common/auth/aws/action.yml`): `aws-actions/configure-aws-credentials@v4`
-- **Azure** (`pipelines/common/auth/azure/action.yml`): `azure/login@v2`
+The centralized auth modules in `pipelines/common/auth/` handle login automatically based on `cloud_provider` using Node 24 native actions:
+- **GCP** (`pipelines/common/auth/gcp/action.yml`): `google-github-actions/auth@v3`
+- **AWS** (`pipelines/common/auth/aws/action.yml`): `aws-actions/configure-aws-credentials@v6`
+- **Azure** (`pipelines/common/auth/azure/action.yml`): `azure/login@v3`
 
 ---
 
 ## 2. Required GitHub Secrets (Per Cloud)
 
-Configure these in **Repo/Org Settings → Secrets and variables → Actions** (or scoped per **GitHub Environment** such as `dev`, `uat`, `prod`):
+Configure these in **Repo/Org Settings → Secrets and variables → Actions → Repository secrets** (so `secrets: inherit` supplies them to the CI `plan` job without requiring a GitHub Environment). You can optionally override them in **GitHub Environments** (`dev`, `uat`, `prod`) if CD deployments use separate per-environment service accounts or approval gates:
 
 | Cloud | Required Secrets | Example Value |
 | :--- | :--- | :--- |
