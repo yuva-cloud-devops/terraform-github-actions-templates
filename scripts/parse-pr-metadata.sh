@@ -156,6 +156,36 @@ if [ "$STACKS_JSON" = "[]" ]; then
   fi
 fi
 
+# 5. Enforce strict dependency hierarchy: foundation -> network -> security -> compute -> availability
+STACKS_JSON=$(STACKS_JSON="$STACKS_JSON" node - <<'EOF'
+let stacks = [];
+try {
+  stacks = JSON.parse(process.env.STACKS_JSON || '[]');
+} catch (e) {
+  stacks = [];
+}
+
+function getLayerRank(stackPath) {
+  const s = stackPath.toLowerCase();
+  if (/(^|[\/_-])(foundation|bootstrap)([\/_-]|$)/.test(s)) return 0;
+  if (/(^|[\/_-])network([\/_-]|$)/.test(s)) return 1;
+  if (/(^|[\/_-])security([\/_-]|$)/.test(s)) return 2;
+  if (/(^|[\/_-])compute([\/_-]|$)/.test(s)) return 3;
+  if (/(^|[\/_-])availability([\/_-]|$)/.test(s)) return 4;
+  return 99;
+}
+
+const unique = [...new Set(stacks)];
+unique.sort((a, b) => {
+  const rankDiff = getLayerRank(a) - getLayerRank(b);
+  if (rankDiff !== 0) return rankDiff;
+  return a.localeCompare(b);
+});
+
+console.log(JSON.stringify(unique));
+EOF
+)
+
 # Output safely to GITHUB_OUTPUT
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "target_env=${TARGET_ENV}" >> "$GITHUB_OUTPUT"
