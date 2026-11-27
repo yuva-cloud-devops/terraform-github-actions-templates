@@ -18,12 +18,15 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Prepare Reports Directory
+      shell: bash
+      run: mkdir -p .security-reports
+
     - name: Run Gitleaks Secret Scan
       if: inputs.tool == 'all' || inputs.tool == 'gitleaks'
       shell: bash
       run: |
         set +e
-        mkdir -p .security-reports
         GITLEAKS_VERSION="8.24.2"
         curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
         if [ -s /tmp/gitleaks.tar.gz ] && tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks 2>/dev/null; then
@@ -89,20 +92,20 @@ runs:
         framework: terraform
         soft_fail: ${{ inputs.fail_on_issues != 'true' }}
         output_format: cli
-        output_file_path: .security-reports/checkov_out
+        output_file_path: checkov_raw
 
     - name: Collect Checkov Report
       if: always() && (inputs.tool == 'all' || inputs.tool == 'checkov')
       shell: bash
       run: |
         mkdir -p .security-reports
-        if [ -f .security-reports/checkov_out/results_cli.txt ]; then
-          cp .security-reports/checkov_out/results_cli.txt .security-reports/checkov_report.txt
-        elif [ -f .security-reports/checkov_out ]; then
-          cp .security-reports/checkov_out .security-reports/checkov_report.txt
+        if [ -f checkov_raw/results_cli.txt ]; then
+          cp checkov_raw/results_cli.txt .security-reports/checkov_report.txt
+        elif [ -f checkov_raw ]; then
+          cp checkov_raw .security-reports/checkov_report.txt
         elif [ -f results_cli.txt ]; then
           cp results_cli.txt .security-reports/checkov_report.txt
+        else
+          echo "Checkov scan completed (no CLI report file emitted)." > .security-reports/checkov_report.txt
         fi
-        if [ -f .security-reports/checkov_report.txt ]; then
-          cat .security-reports/checkov_report.txt
-        fi
+        cat .security-reports/checkov_report.txt

@@ -71,7 +71,7 @@ concurrency:
 
 jobs:
   # ===================================================================
-  # STAGE 1: Metadata Parsing & Schema Validation Gate (Sequential)
+  # STAGE 1: Parse Metadata (PR & Merge)
   # ===================================================================
   parse-pr-metadata:
     name: 1. Parse PR Metadata
@@ -102,6 +102,9 @@ jobs:
           default_env: ${{ inputs.environment }}
           working_dir: ${{ inputs.working_directory }}
 
+  # ===================================================================
+  # STAGE 2: Validate Config & Schema (PR & Merge)
+  # ===================================================================
   validate-schema:
     name: 2. Validate Config & Schema
     needs: [parse-pr-metadata]
@@ -130,50 +133,10 @@ jobs:
           changed_stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
 
   # ===================================================================
-  # STAGE 2 (PR): Dedicated Quality & Security Jobs (Parallel Fan-Out)
+  # STAGE 3 (PR): Security Scans (Parallel Fan-Out)
   # ===================================================================
-  terraform-fmt:
-    name: 3a. Terraform Format (${{ matrix.stack }})
-    needs: [parse-pr-metadata, validate-schema]
-    if: github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ inputs.terraform_version }}
-          terraform_wrapper: false
-      - name: Check Terraform Formatting
-        working-directory: ${{ matrix.stack }}
-        run: terraform fmt -check -recursive
-
-  terraform-validate:
-    name: 3b. Terraform Validate (${{ matrix.stack }})
-    needs: [parse-pr-metadata, validate-schema]
-    if: github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ inputs.terraform_version }}
-          terraform_wrapper: false
-      - name: Init (No Backend) & Validate
-        working-directory: ${{ matrix.stack }}
-        run: |
-          terraform init -backend=false -input=false
-          terraform validate -no-color
-
   gitleaks-scan:
-    name: 3c. Gitleaks Secret Scan
+    name: 3a. Gitleaks Secret Scan
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true'
     runs-on: ubuntu-latest
@@ -202,7 +165,7 @@ jobs:
           if-no-files-found: ignore
 
   trivy-scan:
-    name: 3d. Trivy Vulnerability Scan
+    name: 3b. Trivy Vulnerability Scan
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true'
     runs-on: ubuntu-latest
@@ -229,7 +192,7 @@ jobs:
           if-no-files-found: ignore
 
   tflint-check:
-    name: 3e. TFLint (${{ matrix.stack }})
+    name: 3c. TFLint (${{ matrix.stack }})
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
@@ -253,7 +216,7 @@ jobs:
           fail_on_issues: ${{ inputs.fail_on_security_issues }}
 
   checkov-scan:
-    name: 3f. Checkov CIS Scan (${{ matrix.stack }})
+    name: 3d. Checkov CIS Scan (${{ matrix.stack }})
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
@@ -285,31 +248,67 @@ jobs:
           if-no-files-found: ignore
 
   # ===================================================================
-  # STAGE 3 (PR): Terraform Plan
+  # STAGE 4 (PR): Terraform Format Check (Sequential)
   # ===================================================================
-  terraform-plan:
-    name: 4. Terraform Plan (${{ matrix.stack }})
-    needs:
-      - parse-pr-metadata
-      - validate-schema
-      - terraform-fmt
-      - terraform-validate
-      - gitleaks-scan
-      - trivy-scan
-      - tflint-check
-      - checkov-scan
+  terraform-fmt:
+    name: 4. Terraform Format (${{ matrix.stack }})
+    needs: [parse-pr-metadata, validate-schema, gitleaks-scan, trivy-scan, tflint-check, checkov-scan]
     if: >-
       always()
       && github.event_name == 'pull_request'
       && needs.parse-pr-metadata.outputs.skip_ci != 'true'
       && needs.parse-pr-metadata.outputs.stacks != '[]'
       && needs.validate-schema.result == 'success'
-      && needs.terraform-fmt.result == 'success'
-      && needs.terraform-validate.result == 'success'
       && (needs.gitleaks-scan.result == 'success' || needs.gitleaks-scan.result == 'skipped')
       && (needs.trivy-scan.result == 'success' || needs.trivy-scan.result == 'skipped')
       && (needs.tflint-check.result == 'success' || needs.tflint-check.result == 'skipped')
       && (needs.checkov-scan.result == 'success' || needs.checkov-scan.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+      - name: Check Terraform Formatting
+        working-directory: ${{ matrix.stack }}
+        run: terraform fmt -check -recursive
+
+  # ===================================================================
+  # STAGE 5 (PR): Terraform Validate (Sequential)
+  # ===================================================================
+  terraform-validate:
+    name: 5. Terraform Validate (${{ matrix.stack }})
+    needs: [parse-pr-metadata, terraform-fmt]
+    if: github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+      - name: Init (No Backend) & Validate
+        working-directory: ${{ matrix.stack }}
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+
+  # ===================================================================
+  # STAGE 6 (PR): Terraform Init (backend.hcl) & Plan (Sequential)
+  # ===================================================================
+  terraform-plan:
+    name: 6. Terraform Plan (${{ matrix.stack }})
+    needs: [parse-pr-metadata, terraform-validate]
+    if: github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -376,17 +375,11 @@ jobs:
           if-no-files-found: ignore
 
   # ===================================================================
-  # STAGE 4 (PR): Consolidated PR Plan & Compliance Audit Bot
+  # STAGE 7 (PR): Consolidated PR Plan & Compliance Audit Bot
   # ===================================================================
   pr-bot-comment:
-    name: 5. PR Plan & Compliance Bot
-    needs:
-      - parse-pr-metadata
-      - validate-schema
-      - gitleaks-scan
-      - trivy-scan
-      - checkov-scan
-      - terraform-plan
+    name: 7. PR Plan & Compliance Bot
+    needs: [parse-pr-metadata, validate-schema, gitleaks-scan, trivy-scan, checkov-scan, terraform-plan]
     if: always() && github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.validate-schema.result == 'success'
     runs-on: ubuntu-latest
     permissions:
@@ -417,10 +410,10 @@ jobs:
           stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
 
   # ===================================================================
-  # STAGE 3 (MERGE): Sequential Terraform Apply Behind Environment Gate
+  # CD STAGE 1 (MERGE): Sequential Terraform Apply Behind Environment Gate
   # ===================================================================
   terraform-apply:
-    name: 3. Terraform Apply (${{ matrix.stack }})
+    name: CD-1. Terraform Apply (${{ matrix.stack }})
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]' && needs.validate-schema.result == 'success'
     runs-on: ubuntu-latest
@@ -493,10 +486,10 @@ jobs:
           if-no-files-found: ignore
 
   # ===================================================================
-  # STAGE 4 (MERGE): Consolidated CD Deployment Audit Bot
+  # CD STAGE 2 (MERGE): Consolidated CD Deployment Audit Bot
   # ===================================================================
   deployment-audit-bot:
-    name: 4. CD Deployment Audit Bot
+    name: CD-2. Deployment Audit Bot
     needs: [parse-pr-metadata, validate-schema, terraform-apply]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.validate-schema.result == 'success' && (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'failure')
     runs-on: ubuntu-latest
