@@ -1,9 +1,13 @@
 name: "Security & Static Analysis"
-description: "Runs Gitleaks, Trivy, TFLint, or Checkov (individually via tool input or all) and saves reports"
+description: "Runs Gitleaks, Trivy, TFLint, or Checkov and saves reports to security-reports/"
 inputs:
   working_directory:
     required: false
     default: "."
+  stacks:
+    description: "Optional JSON array of stack directories"
+    required: false
+    default: "[]"
   github_token:
     required: true
   fail_on_issues:
@@ -18,9 +22,23 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Prepare Reports Directory
+    - name: Prepare Reports Directory & Target
+      id: prep
       shell: bash
-      run: mkdir -p .security-reports
+      env:
+        STACKS_JSON: ${{ inputs.stacks }}
+        FALLBACK_DIR: ${{ inputs.working_directory }}
+      run: |
+        mkdir -p security-reports
+        COUNT=$(echo "$STACKS_JSON" | jq 'length' 2>/dev/null || echo 0)
+        if [ "$COUNT" -eq 1 ]; then
+          SCAN_TARGET=$(echo "$STACKS_JSON" | jq -r '.[0]')
+        elif [ "$COUNT" -gt 1 ]; then
+          SCAN_TARGET="."
+        else
+          SCAN_TARGET="$FALLBACK_DIR"
+        fi
+        echo "scan_target=$SCAN_TARGET" >> "$GITHUB_OUTPUT"
 
     - name: Run Gitleaks Secret Scan
       if: inputs.tool == 'all' || inputs.tool == 'gitleaks'
@@ -30,10 +48,10 @@ runs:
         GITLEAKS_VERSION="8.24.2"
         curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
         if [ -s /tmp/gitleaks.tar.gz ] && tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks 2>/dev/null; then
-          /tmp/gitleaks detect --source=. --verbose --redact 2>&1 | tee .security-reports/gitleaks_report.txt
+          /tmp/gitleaks detect --source=. --verbose --redact 2>&1 | tee security-reports/gitleaks_report.txt
           GL_EXIT=${PIPESTATUS[0]}
         else
-          echo "Fallback: Gitleaks binary download unavailable; no leaks reported locally." | tee .security-reports/gitleaks_report.txt
+          echo "Fallback: Gitleaks binary download unavailable; no leaks reported locally." | tee security-reports/gitleaks_report.txt
           GL_EXIT=0
         fi
         set -e
@@ -50,7 +68,7 @@ runs:
         scanners: "vuln,misconfig"
         scan-ref: "."
         format: "table"
-        output: ".security-reports/trivy_report.txt"
+        output: "security-reports/trivy_report.txt"
         severity: "HIGH,CRITICAL"
         exit-code: ${{ inputs.fail_on_issues == 'true' && '1' || '0' }}
 
@@ -58,8 +76,8 @@ runs:
       if: always() && (inputs.tool == 'all' || inputs.tool == 'trivy')
       shell: bash
       run: |
-        if [ -f .security-reports/trivy_report.txt ]; then
-          cat .security-reports/trivy_report.txt
+        if [ -f security-reports/trivy_report.txt ]; then
+          cat security-reports/trivy_report.txt
         fi
 
     - name: Setup TFLint
@@ -68,19 +86,29 @@ runs:
       with:
         tflint_version: "latest"
 
-    - name: Run TFLint
+    - name: Run TFLint Across Target Stacks
       if: inputs.tool == 'all' || inputs.tool == 'tflint'
       shell: bash
-      working-directory: ${{ inputs.working_directory }}
       env:
+        STACKS_JSON: ${{ inputs.stacks }}
+        FALLBACK_DIR: ${{ inputs.working_directory }}
         FAIL_ON_ISSUES: ${{ inputs.fail_on_issues }}
       run: |
-        tflint --init || true
-        if [ "$FAIL_ON_ISSUES" = "true" ]; then
-          tflint -f compact
-        else
-          tflint -f compact || echo "::warning::TFLint reported warnings/issues in ${{ inputs.working_directory }}"
+        TARGET_LIST=$(echo "$STACKS_JSON" | jq -r '.[]' 2>/dev/null || true)
+        if [ -z "$TARGET_LIST" ]; then
+          TARGET_LIST="$FALLBACK_DIR"
         fi
+        for dir in $TARGET_LIST; do
+          echo "Running TFLint in $dir..."
+          pushd "$dir" >/dev/null
+          tflint --init || true
+          if [ "$FAIL_ON_ISSUES" = "true" ]; then
+            tflint -f compact
+          else
+            tflint -f compact || echo "::warning::TFLint reported warnings/issues in $dir"
+          fi
+          popd >/dev/null
+        done
 
     - name: Run Checkov Policy Scan
       if: inputs.tool == 'all' || inputs.tool == 'checkov'
@@ -88,7 +116,7 @@ runs:
       uses: bridgecrewio/checkov-action@v12
       continue-on-error: ${{ inputs.fail_on_issues != 'true' }}
       with:
-        directory: ${{ inputs.working_directory }}
+        directory: ${{ steps.prep.outputs.scan_target }}
         framework: terraform
         soft_fail: ${{ inputs.fail_on_issues != 'true' }}
         output_format: cli
@@ -98,14 +126,14 @@ runs:
       if: always() && (inputs.tool == 'all' || inputs.tool == 'checkov')
       shell: bash
       run: |
-        mkdir -p .security-reports
+        mkdir -p security-reports
         if [ -f checkov_raw/results_cli.txt ]; then
-          cp checkov_raw/results_cli.txt .security-reports/checkov_report.txt
+          cp checkov_raw/results_cli.txt security-reports/checkov_report.txt
         elif [ -f checkov_raw ]; then
-          cp checkov_raw .security-reports/checkov_report.txt
+          cp checkov_raw security-reports/checkov_report.txt
         elif [ -f results_cli.txt ]; then
-          cp results_cli.txt .security-reports/checkov_report.txt
+          cp results_cli.txt security-reports/checkov_report.txt
         else
-          echo "Checkov scan completed (no CLI report file emitted)." > .security-reports/checkov_report.txt
+          echo "Checkov scan completed (no CLI report file emitted)." > security-reports/checkov_report.txt
         fi
-        cat .security-reports/checkov_report.txt
+        cat security-reports/checkov_report.txt

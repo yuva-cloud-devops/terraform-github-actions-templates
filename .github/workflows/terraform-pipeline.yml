@@ -71,10 +71,10 @@ concurrency:
 
 jobs:
   # ===================================================================
-  # STAGE 1: Parse Metadata (PR & Merge)
+  # COMMON STEP 1: Parse PR / Commit Metadata
   # ===================================================================
   parse-pr-metadata:
-    name: 1. Parse PR Metadata
+    name: Step 1 - Parse PR & Config Metadata
     runs-on: ubuntu-latest
     outputs:
       env: ${{ steps.parse.outputs.target_env }}
@@ -103,10 +103,10 @@ jobs:
           working_dir: ${{ inputs.working_directory }}
 
   # ===================================================================
-  # STAGE 2: Validate Config & Schema (PR & Merge)
+  # COMMON STEP 2: Validate Config YAML & JSON Schema
   # ===================================================================
   validate-schema:
-    name: 2. Validate Config & Schema
+    name: Step 2 - Validate Config & Schema
     needs: [parse-pr-metadata]
     if: needs.parse-pr-metadata.outputs.skip_ci != 'true'
     runs-on: ubuntu-latest
@@ -133,10 +133,10 @@ jobs:
           changed_stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
 
   # ===================================================================
-  # STAGE 3 (PR): Security Scans (Parallel Fan-Out)
+  # CI STAGE 3 (PR): Parallel Security Scans
   # ===================================================================
   gitleaks-scan:
-    name: 3a. Gitleaks Secret Scan
+    name: CI - Gitleaks Secret Scan
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true'
     runs-on: ubuntu-latest
@@ -160,12 +160,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: gitleaks-report
-          path: .security-reports/gitleaks_report.txt
+          path: security-reports/gitleaks_report.txt
           retention-days: 7
           if-no-files-found: ignore
 
   trivy-scan:
-    name: 3b. Trivy Vulnerability Scan
+    name: CI - Trivy Vulnerability Scan
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true'
     runs-on: ubuntu-latest
@@ -187,19 +187,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: trivy-report
-          path: .security-reports/trivy_report.txt
+          path: security-reports/trivy_report.txt
           retention-days: 7
           if-no-files-found: ignore
 
   tflint-check:
-    name: 3c. TFLint (${{ matrix.stack }})
+    name: CI - TFLint Check
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -211,19 +207,16 @@ jobs:
       - uses: ./.github-templates/pipelines/continuous-integration/security-scan
         with:
           tool: "tflint"
-          working_directory: ${{ matrix.stack }}
+          stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
+          working_directory: ${{ inputs.working_directory }}
           github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
           fail_on_issues: ${{ inputs.fail_on_security_issues }}
 
   checkov-scan:
-    name: 3d. Checkov CIS Scan (${{ matrix.stack }})
+    name: CI - Checkov Policy Scan
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -235,23 +228,24 @@ jobs:
       - uses: ./.github-templates/pipelines/continuous-integration/security-scan
         with:
           tool: "checkov"
-          working_directory: ${{ matrix.stack }}
+          stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
+          working_directory: ${{ inputs.working_directory }}
           github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
           fail_on_issues: ${{ inputs.fail_on_security_issues }}
       - name: Upload Checkov Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: checkov-report-${{ strategy.job-index }}
-          path: .security-reports/checkov_report.txt
+          name: checkov-report
+          path: security-reports/checkov_report.txt
           retention-days: 7
           if-no-files-found: ignore
 
   # ===================================================================
-  # STAGE 4 (PR): Terraform Format Check (Sequential)
+  # CI STAGE 4 (PR): Terraform Format Check (Sequential)
   # ===================================================================
   terraform-fmt:
-    name: 4. Terraform Format (${{ matrix.stack }})
+    name: CI - Terraform Format Check
     needs: [parse-pr-metadata, validate-schema, gitleaks-scan, trivy-scan, tflint-check, checkov-scan]
     if: >-
       always()
@@ -264,10 +258,6 @@ jobs:
       && (needs.tflint-check.result == 'success' || needs.tflint-check.result == 'skipped')
       && (needs.checkov-scan.result == 'success' || needs.checkov-scan.result == 'skipped')
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -275,21 +265,22 @@ jobs:
           terraform_version: ${{ inputs.terraform_version }}
           terraform_wrapper: false
       - name: Check Terraform Formatting
-        working-directory: ${{ matrix.stack }}
-        run: terraform fmt -check -recursive
+        env:
+          STACKS_JSON: ${{ needs.parse-pr-metadata.outputs.stacks }}
+        run: |
+          for dir in $(echo "$STACKS_JSON" | jq -r '.[]'); do
+            echo "Checking format in $dir..."
+            terraform -chdir="$dir" fmt -check -recursive
+          done
 
   # ===================================================================
-  # STAGE 5 (PR): Terraform Validate (Sequential)
+  # CI STAGE 5 (PR): Terraform Validate (Sequential)
   # ===================================================================
   terraform-validate:
-    name: 5. Terraform Validate (${{ matrix.stack }})
+    name: CI - Terraform Validate
     needs: [parse-pr-metadata, terraform-fmt]
     if: github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -297,23 +288,23 @@ jobs:
           terraform_version: ${{ inputs.terraform_version }}
           terraform_wrapper: false
       - name: Init (No Backend) & Validate
-        working-directory: ${{ matrix.stack }}
+        env:
+          STACKS_JSON: ${{ needs.parse-pr-metadata.outputs.stacks }}
         run: |
-          terraform init -backend=false -input=false
-          terraform validate -no-color
+          for dir in $(echo "$STACKS_JSON" | jq -r '.[]'); do
+            echo "Validating $dir..."
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate -no-color
+          done
 
   # ===================================================================
-  # STAGE 6 (PR): Terraform Init (backend.hcl) & Plan (Sequential)
+  # CI STAGE 6 (PR): Terraform Init (backend.hcl) & Plan (Sequential)
   # ===================================================================
   terraform-plan:
-    name: 6. Terraform Plan (${{ matrix.stack }})
+    name: CI - Terraform Plan
     needs: [parse-pr-metadata, terraform-validate]
     if: github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
     permissions:
       id-token: write
       contents: read
@@ -360,7 +351,8 @@ jobs:
         with:
           cloud_provider: ${{ inputs.cloud_provider }}
           environment: ${{ needs.parse-pr-metadata.outputs.env }}
-          working_directory: ${{ matrix.stack }}
+          stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
+          working_directory: ${{ inputs.working_directory }}
           config_file: ${{ needs.parse-pr-metadata.outputs.config_file }}
           state_bucket: ${{ inputs.state_bucket }}
           skip_fmt_validate: "true"
@@ -369,16 +361,16 @@ jobs:
         if: always() && steps.tf_plan.outputs.report_path != ''
         uses: actions/upload-artifact@v4
         with:
-          name: plan-outputs-${{ strategy.job-index }}
-          path: ${{ steps.tf_plan.outputs.report_path }}/
+          name: plan-outputs
+          path: ${{ steps.tf_plan.outputs.report_path }}
           retention-days: 14
           if-no-files-found: ignore
 
   # ===================================================================
-  # STAGE 7 (PR): Consolidated PR Plan & Compliance Audit Bot
+  # CI STAGE 7 (PR): Post Consolidated PR Plan & Compliance Comment
   # ===================================================================
   pr-bot-comment:
-    name: 7. PR Plan & Compliance Bot
+    name: CI - Post Plan & Audit Comment
     needs: [parse-pr-metadata, validate-schema, gitleaks-scan, trivy-scan, checkov-scan, terraform-plan]
     if: always() && github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.validate-schema.result == 'success'
     runs-on: ubuntu-latest
@@ -397,14 +389,14 @@ jobs:
       - name: Download Security & Plan Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: .ci-artifacts
+          path: ci-artifacts
 
       - name: Post Consolidated PR Comment
         uses: ./.github-templates/pipelines/common/bot
         with:
           github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
           mode: "plan"
-          artifacts_dir: ".ci-artifacts"
+          artifacts_dir: "ci-artifacts"
           environment: ${{ needs.parse-pr-metadata.outputs.env }}
           cloud_provider: ${{ inputs.cloud_provider }}
           stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
@@ -413,19 +405,14 @@ jobs:
   # CD STAGE 1 (MERGE): Sequential Terraform Apply Behind Environment Gate
   # ===================================================================
   terraform-apply:
-    name: CD-1. Terraform Apply (${{ matrix.stack }})
+    name: CD - Terraform Apply (${{ needs.parse-pr-metadata.outputs.env }})
     needs: [parse-pr-metadata, validate-schema]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]' && needs.validate-schema.result == 'success'
     runs-on: ubuntu-latest
     environment: ${{ needs.parse-pr-metadata.outputs.env }}
     concurrency:
-      group: tf-apply-${{ inputs.cloud_provider }}-${{ needs.parse-pr-metadata.outputs.env }}-${{ matrix.stack }}
+      group: tf-apply-${{ inputs.cloud_provider }}-${{ needs.parse-pr-metadata.outputs.env }}
       cancel-in-progress: false
-    strategy:
-      fail-fast: true
-      max-parallel: 1
-      matrix:
-        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
     permissions:
       id-token: write
       contents: read
@@ -472,7 +459,8 @@ jobs:
         with:
           cloud_provider: ${{ inputs.cloud_provider }}
           environment: ${{ needs.parse-pr-metadata.outputs.env }}
-          working_directory: ${{ matrix.stack }}
+          stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
+          working_directory: ${{ inputs.working_directory }}
           config_file: ${{ needs.parse-pr-metadata.outputs.config_file }}
           state_bucket: ${{ inputs.state_bucket }}
 
@@ -480,16 +468,16 @@ jobs:
         if: always() && steps.tf_apply.outputs.report_path != ''
         uses: actions/upload-artifact@v4
         with:
-          name: apply-outputs-${{ strategy.job-index }}
-          path: ${{ steps.tf_apply.outputs.report_path }}/
+          name: apply-outputs
+          path: ${{ steps.tf_apply.outputs.report_path }}
           retention-days: 90
           if-no-files-found: ignore
 
   # ===================================================================
-  # CD STAGE 2 (MERGE): Consolidated CD Deployment Audit Bot
+  # CD STAGE 2 (MERGE): Post Deployment Audit Comment on Merged PR
   # ===================================================================
   deployment-audit-bot:
-    name: CD-2. Deployment Audit Bot
+    name: CD - Post Deployment Audit Comment
     needs: [parse-pr-metadata, validate-schema, terraform-apply]
     if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.validate-schema.result == 'success' && (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'failure')
     runs-on: ubuntu-latest
@@ -508,13 +496,13 @@ jobs:
       - name: Download Apply Artifacts
         uses: actions/download-artifact@v4
         with:
-          path: .cd-artifacts
+          path: cd-artifacts
 
       - name: Post CD Deployment Audit Comment
         uses: ./.github-templates/pipelines/continuous-provisioning/deployment-audit
         with:
           github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
-          artifacts_dir: ".cd-artifacts"
+          artifacts_dir: "cd-artifacts"
           environment: ${{ needs.parse-pr-metadata.outputs.env }}
           cloud_provider: ${{ inputs.cloud_provider }}
           state_bucket: ${{ inputs.state_bucket }}

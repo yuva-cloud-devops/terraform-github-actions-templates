@@ -1,5 +1,5 @@
 name: "Terraform Apply"
-description: "Generates backend.hcl dynamically, executes terraform apply, and exports outputs.json"
+description: "Generates backend.hcl dynamically, executes sequential terraform apply across stacks, and exports outputs.json"
 inputs:
   cloud_provider:
     required: true
@@ -8,6 +8,10 @@ inputs:
   working_directory:
     required: false
     default: "."
+  stacks:
+    description: "Optional JSON array of stack directories"
+    required: false
+    default: "[]"
   config_file:
     description: "Optional environment config filename (e.g. compute.yaml)"
     required: false
@@ -18,7 +22,7 @@ inputs:
     default: ""
 outputs:
   report_path:
-    description: "Path to apply artifact directory"
+    description: "Path to apply artifacts directory"
     value: ${{ steps.apply.outputs.artifact_dir }}
   exitcode:
     description: "Terraform apply exit code"
@@ -27,121 +31,152 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Generate backend.hcl, Init, Apply & Export Outputs
+    - name: Generate backend.hcl, Init & Sequential Apply
       id: apply
       shell: bash
-      working-directory: ${{ inputs.working_directory }}
       env:
         CLOUD: ${{ inputs.cloud_provider }}
         ENV: ${{ inputs.environment }}
-        STACK_PATH: ${{ inputs.working_directory }}
+        FALLBACK_DIR: ${{ inputs.working_directory }}
+        STACKS_JSON: ${{ inputs.stacks }}
         CONFIG_FILE_INPUT: ${{ inputs.config_file }}
         STATE_BUCKET_OVERRIDE: ${{ inputs.state_bucket }}
         TF_VAR_environment: ${{ inputs.environment }}
       run: |
         set +e
+        ARTIFACTS_ROOT="$(pwd)/tf-apply-artifacts"
+        mkdir -p "$ARTIFACTS_ROOT"
+
         if [ -n "$CONFIG_FILE_INPUT" ]; then
           if [ -f "${GITHUB_WORKSPACE}/environments/${ENV}/${CONFIG_FILE_INPUT}" ]; then
             export TF_VAR_config_file="${GITHUB_WORKSPACE}/environments/${ENV}/${CONFIG_FILE_INPUT}"
-          elif [ -f "environments/${ENV}/${CONFIG_FILE_INPUT}" ]; then
-            export TF_VAR_config_file="$(pwd)/environments/${ENV}/${CONFIG_FILE_INPUT}"
           fi
         fi
 
-        if [ "$STACK_PATH" = "." ] || [ -z "$STACK_PATH" ]; then
-          STACK_NAME=$(basename "$(pwd)")
-        else
-          STACK_NAME="${STACK_PATH#./}"
-          STACK_NAME="${STACK_NAME%/}"
+        TARGET_LIST=$(echo "$STACKS_JSON" | jq -r '.[]' 2>/dev/null || true)
+        if [ -z "$TARGET_LIST" ]; then
+          TARGET_LIST="$FALLBACK_DIR"
         fi
-        AZURE_KEY=$(echo "${ENV}-${STACK_NAME}.tfstate" | tr '/' '-')
-        BUCKET_NAME=""
 
-        case "$CLOUD" in
-          gcp)
-            BUCKET_NAME="${STATE_BUCKET_OVERRIDE:-${ENV}-tfstate-bucket}"
-            cat > backend.hcl <<EOF
+        OVERALL_EXIT=0
+        IDX=0
+
+        for STACK_PATH in $TARGET_LIST; do
+          echo "================================================================="
+          echo "Applying Stack [$IDX]: $STACK_PATH (Env: $ENV)"
+          echo "================================================================="
+
+          pushd "$STACK_PATH" >/dev/null
+
+          if [ -z "${TF_VAR_config_file:-}" ] && [ -n "$CONFIG_FILE_INPUT" ] && [ -f "environments/${ENV}/${CONFIG_FILE_INPUT}" ]; then
+            export TF_VAR_config_file="$(pwd)/environments/${ENV}/${CONFIG_FILE_INPUT}"
+          fi
+
+          if [ "$STACK_PATH" = "." ] || [ -z "$STACK_PATH" ]; then
+            STACK_NAME=$(basename "$(pwd)")
+          else
+            STACK_NAME="${STACK_PATH#./}"
+            STACK_NAME="${STACK_NAME%/}"
+          fi
+          AZURE_KEY=$(echo "${ENV}-${STACK_NAME}.tfstate" | tr '/' '-')
+          BUCKET_NAME=""
+
+          case "$CLOUD" in
+            gcp)
+              BUCKET_NAME="${STATE_BUCKET_OVERRIDE:-${ENV}-tfstate-bucket}"
+              cat > backend.hcl <<EOF
         bucket = "${BUCKET_NAME}"
         prefix = "${ENV}/${STACK_NAME}"
         EOF
-            ;;
-          aws)
-            BUCKET_NAME="${STATE_BUCKET_OVERRIDE:-org-terraform-state-${ENV}}"
-            cat > backend.hcl <<EOF
+              ;;
+            aws)
+              BUCKET_NAME="${STATE_BUCKET_OVERRIDE:-org-terraform-state-${ENV}}"
+              cat > backend.hcl <<EOF
         bucket         = "${BUCKET_NAME}"
         key            = "${ENV}/${STACK_NAME}/terraform.tfstate"
         dynamodb_table = "tf-locks-${ENV}"
         EOF
-            ;;
-          azure)
-            BUCKET_NAME="${STATE_BUCKET_OVERRIDE:-sttfstate${ENV}}"
-            cat > backend.hcl <<EOF
+              ;;
+            azure)
+              BUCKET_NAME="${STATE_BUCKET_OVERRIDE:-sttfstate${ENV}}"
+              cat > backend.hcl <<EOF
         resource_group_name  = "rg-tfstate-${ENV}"
         storage_account_name = "${BUCKET_NAME}"
         container_name       = "tfstate"
         key                  = "${AZURE_KEY}"
         EOF
-            ;;
-          *)
-            echo "::error::Unsupported cloud provider: $CLOUD" | tee apply.log
-            echo "exitcode=1" >> "$GITHUB_OUTPUT"
-            exit 1
-            ;;
-        esac
+              ;;
+            *)
+              echo "::error::Unsupported cloud provider: $CLOUD" | tee apply.log
+              STACK_EXIT=1
+              echo "{}" > outputs.json
+              ;;
+          esac
 
-        echo "=== Generated backend.hcl (${CLOUD} | ${ENV} | ${STACK_NAME}) ==="
-        cat backend.hcl
-        echo "================================================================="
+          echo "=== Generated backend.hcl (${CLOUD} | ${ENV} | ${STACK_NAME}) ==="
+          cat backend.hcl
+          echo "================================================================="
 
-        FINAL_EXIT=0
-        terraform init -input=false -reconfigure -backend-config=backend.hcl > apply.log 2>&1
-        INIT_EXIT=$?
-        if [ $INIT_EXIT -ne 0 ]; then
-          cat apply.log
-          echo "::error::Terraform init failed with exit code $INIT_EXIT"
-          FINAL_EXIT=$INIT_EXIT
-          echo "{}" > outputs.json
-        else
-          EXTRA_ARGS=""
-          if [ -f "environments/${ENV}.tfvars" ]; then
-            EXTRA_ARGS="-var-file=environments/${ENV}.tfvars"
-          elif [ -f "environments/${ENV}.tfvars.json" ]; then
-            EXTRA_ARGS="-var-file=environments/${ENV}.tfvars.json"
-          fi
-
-          terraform apply -input=false -auto-approve -no-color $EXTRA_ARGS >> apply.log 2>&1
-          APPLY_EXIT=$?
-          cat apply.log
-          FINAL_EXIT=$APPLY_EXIT
-
-          if [ $APPLY_EXIT -eq 0 ]; then
-            terraform output -json > outputs.json 2>/dev/null || echo "{}" > outputs.json
-          else
+          STACK_EXIT=0
+          terraform init -input=false -reconfigure -backend-config=backend.hcl > apply.log 2>&1
+          INIT_EXIT=$?
+          if [ $INIT_EXIT -ne 0 ]; then
+            cat apply.log
+            echo "::error::Terraform init failed in ${STACK_PATH} with exit code $INIT_EXIT"
+            STACK_EXIT=$INIT_EXIT
             echo "{}" > outputs.json
-            echo "::error::Terraform apply failed with exit code $APPLY_EXIT"
+          else
+            EXTRA_ARGS=""
+            if [ -f "environments/${ENV}.tfvars" ]; then
+              EXTRA_ARGS="-var-file=environments/${ENV}.tfvars"
+            elif [ -f "environments/${ENV}.tfvars.json" ]; then
+              EXTRA_ARGS="-var-file=environments/${ENV}.tfvars.json"
+            fi
+
+            terraform apply -input=false -auto-approve -no-color $EXTRA_ARGS >> apply.log 2>&1
+            APPLY_EXIT=$?
+            cat apply.log
+            STACK_EXIT=$APPLY_EXIT
+
+            if [ $APPLY_EXIT -eq 0 ]; then
+              terraform output -json > outputs.json 2>/dev/null || echo "{}" > outputs.json
+            else
+              echo "{}" > outputs.json
+              echo "::error::Terraform apply failed in ${STACK_PATH} with exit code $APPLY_EXIT"
+            fi
           fi
-        fi
 
-        mkdir -p .tf-apply-out
-        cp outputs.json .tf-apply-out/outputs.json
-        cp apply.log .tf-apply-out/apply.log
-        cp backend.hcl .tf-apply-out/backend.hcl
-        STACK_NAME="$STACK_NAME" BUCKET_NAME="$BUCKET_NAME" FINAL_EXIT="$FINAL_EXIT" node -e '
-          const fs = require("fs");
-          fs.writeFileSync(".tf-apply-out/meta.json", JSON.stringify({
-            stack: process.env.STACK_NAME,
-            dir: process.env.STACK_PATH,
-            env: process.env.ENV,
-            cloud: process.env.CLOUD,
-            bucket: process.env.BUCKET_NAME,
-            exitcode: Number(process.env.FINAL_EXIT)
-          }, null, 2));
-        '
+          OUT_DIR="${ARTIFACTS_ROOT}/${IDX}"
+          mkdir -p "$OUT_DIR"
+          cp outputs.json "${OUT_DIR}/outputs.json"
+          cp apply.log "${OUT_DIR}/apply.log"
+          cp backend.hcl "${OUT_DIR}/backend.hcl"
+          STACK_NAME="$STACK_NAME" STACK_PATH="$STACK_PATH" BUCKET_NAME="$BUCKET_NAME" STACK_EXIT="$STACK_EXIT" node -e '
+            const fs = require("fs");
+            fs.writeFileSync(process.env.OUT_DIR + "/meta.json", JSON.stringify({
+              stack: process.env.STACK_NAME,
+              dir: process.env.STACK_PATH,
+              env: process.env.ENV,
+              cloud: process.env.CLOUD,
+              bucket: process.env.BUCKET_NAME,
+              exitcode: Number(process.env.STACK_EXIT)
+            }, null, 2));
+          ' OUT_DIR="$OUT_DIR"
 
-        echo "exitcode=$FINAL_EXIT" >> "$GITHUB_OUTPUT"
-        echo "artifact_dir=$(pwd)/.tf-apply-out" >> "$GITHUB_OUTPUT"
+          popd >/dev/null
+          IDX=$((IDX + 1))
+
+          # Fail-fast sequential apply: stop immediately if any layer fails
+          if [ "$STACK_EXIT" -ne 0 ]; then
+            OVERALL_EXIT=$STACK_EXIT
+            break
+          fi
+        done
+
+        echo "exitcode=$OVERALL_EXIT" >> "$GITHUB_OUTPUT"
+        echo "artifact_dir=$ARTIFACTS_ROOT" >> "$GITHUB_OUTPUT"
         set -e
 
-        if [ "$FINAL_EXIT" -ne 0 ]; then
-          exit "$FINAL_EXIT"
+        if [ "$OVERALL_EXIT" -ne 0 ]; then
+          exit "$OVERALL_EXIT"
         fi
