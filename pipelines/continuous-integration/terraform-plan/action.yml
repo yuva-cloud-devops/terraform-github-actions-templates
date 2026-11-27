@@ -160,7 +160,7 @@ runs:
           cp tfplan.json "${OUT_DIR}/tfplan.json"
           cp plan.txt "${OUT_DIR}/plan.txt"
           cp backend.hcl "${OUT_DIR}/backend.hcl"
-          STACK_NAME="$STACK_NAME" STACK_PATH="$STACK_PATH" STACK_EXIT="$STACK_EXIT" node -e '
+          OUT_DIR="$OUT_DIR" STACK_NAME="$STACK_NAME" STACK_PATH="$STACK_PATH" STACK_EXIT="$STACK_EXIT" node -e '
             const fs = require("fs");
             fs.writeFileSync(process.env.OUT_DIR + "/meta.json", JSON.stringify({
               stack: process.env.STACK_NAME,
@@ -169,7 +169,8 @@ runs:
               cloud: process.env.CLOUD,
               exitcode: Number(process.env.STACK_EXIT)
             }, null, 2));
-          ' OUT_DIR="$OUT_DIR"
+          '
+          ls -la "$OUT_DIR"
 
           popd >/dev/null
           IDX=$((IDX + 1))
