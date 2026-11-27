@@ -15,7 +15,7 @@ runs:
   using: "composite"
   steps:
     - name: Run Trivy IaC Config Scan
-      uses: aquasecurity/trivy-action@0.29.0
+      uses: aquasecurity/trivy-action@v0.36.0
       continue-on-error: ${{ inputs.fail_on_issues != 'true' }}
       with:
         scan-type: "config"
@@ -24,7 +24,7 @@ runs:
         exit-code: ${{ inputs.fail_on_issues == 'true' && '1' || '0' }}
 
     - name: Run Trivy Secret Filesystem Scan
-      uses: aquasecurity/trivy-action@0.29.0
+      uses: aquasecurity/trivy-action@v0.36.0
       continue-on-error: ${{ inputs.fail_on_issues != 'true' }}
       with:
         scan-type: "fs"
