@@ -83,12 +83,12 @@ jobs:
       skip_ci: ${{ steps.parse.outputs.skip_ci }}
     steps:
       - name: Checkout Consumer Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 2
 
       - name: Checkout Centralized Templates
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -112,10 +112,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Consumer Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Checkout Centralized Templates
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -141,10 +141,10 @@ jobs:
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -157,7 +157,7 @@ jobs:
           fail_on_issues: ${{ inputs.fail_on_security_issues }}
       - name: Upload Gitleaks Report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gitleaks-report
           path: security-reports/gitleaks_report.txt
@@ -170,8 +170,8 @@ jobs:
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -184,7 +184,7 @@ jobs:
           fail_on_issues: ${{ inputs.fail_on_security_issues }}
       - name: Upload Trivy Report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy-report
           path: security-reports/trivy_report.txt
@@ -197,8 +197,8 @@ jobs:
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -218,8 +218,8 @@ jobs:
     if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -234,7 +234,7 @@ jobs:
           fail_on_issues: ${{ inputs.fail_on_security_issues }}
       - name: Upload Checkov Report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: checkov-report
           path: security-reports/checkov_report.txt
@@ -259,8 +259,8 @@ jobs:
       && (needs.checkov-scan.result == 'success' || needs.checkov-scan.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ inputs.terraform_version }}
           terraform_wrapper: false
@@ -282,8 +282,8 @@ jobs:
     if: github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@v6
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ inputs.terraform_version }}
           terraform_wrapper: false
@@ -309,8 +309,8 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -340,7 +340,7 @@ jobs:
           subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ inputs.terraform_version }}
           terraform_wrapper: false
@@ -359,7 +359,7 @@ jobs:
 
       - name: Upload Plan Outputs Artifact
         if: always() && steps.tf_plan.outputs.report_path != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: plan-outputs
           path: ${{ steps.tf_plan.outputs.report_path }}
@@ -379,7 +379,7 @@ jobs:
       issues: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -387,7 +387,7 @@ jobs:
           fetch-depth: 1
 
       - name: Download Security & Plan Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ci-artifacts
 
@@ -417,8 +417,8 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -448,7 +448,7 @@ jobs:
           subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ inputs.terraform_version }}
           terraform_wrapper: false
@@ -466,7 +466,7 @@ jobs:
 
       - name: Upload Apply Outputs Artifact
         if: always() && steps.tf_apply.outputs.report_path != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: apply-outputs
           path: ${{ steps.tf_apply.outputs.report_path }}
@@ -486,7 +486,7 @@ jobs:
       issues: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -494,7 +494,7 @@ jobs:
           fetch-depth: 1
 
       - name: Download Apply Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: cd-artifacts
 

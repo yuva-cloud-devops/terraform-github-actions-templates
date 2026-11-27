@@ -20,7 +20,7 @@ runs:
         fi
 
     - name: Azure OIDC Auth
-      uses: azure/login@v2
+      uses: azure/login@v3
       with:
         client-id: ${{ inputs.client_id }}
         tenant-id: ${{ inputs.tenant_id }}
