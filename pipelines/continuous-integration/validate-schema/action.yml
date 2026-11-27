@@ -1,0 +1,45 @@
+name: "Validate Request Schema"
+description: "Validates deployment request against templates schema and matches configuration YAML against schema/<name>.schema.json"
+inputs:
+  schema_path:
+    description: "Path to deployment request schema file"
+    required: true
+  env_file:
+    description: "Optional path to root environment yaml/json file"
+    required: false
+    default: ""
+  cloud_provider:
+    description: "Target cloud provider"
+    required: false
+    default: ""
+  target_env:
+    description: "Target environment name"
+    required: false
+    default: ""
+  config_file:
+    description: "Configuration YAML filename (e.g. compute.yaml)"
+    required: false
+    default: ""
+  changed_stacks:
+    description: "JSON array of target stacks"
+    required: false
+    default: "[]"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate Schema
+      shell: bash
+      env:
+        SCHEMA_PATH: ${{ inputs.schema_path }}
+        ENV_FILE: ${{ inputs.env_file }}
+        CLOUD_PROVIDER: ${{ inputs.cloud_provider }}
+        TARGET_ENV: ${{ inputs.target_env }}
+        CONFIG_FILE: ${{ inputs.config_file }}
+        CHANGED_STACKS: ${{ inputs.changed_stacks }}
+      run: |
+        SCRIPT_PATH="${{ github.action_path }}/../../../scripts/validate-request.sh"
+        if [ ! -f "$SCRIPT_PATH" ]; then
+          SCRIPT_PATH=".github-templates/scripts/validate-request.sh"
+        fi
+        bash "$SCRIPT_PATH"

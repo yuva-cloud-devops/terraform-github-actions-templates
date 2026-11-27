@@ -1,0 +1,27 @@
+name: "Auth Azure"
+description: "Federated Credentials for Microsoft Azure"
+inputs:
+  client_id:
+    required: true
+  tenant_id:
+    required: true
+  subscription_id:
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate Azure Credentials
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.client_id }}" ] || [ -z "${{ inputs.tenant_id }}" ] || [ -z "${{ inputs.subscription_id }}" ]; then
+          echo "::error::One or more Azure credentials (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID) are missing or empty."
+          exit 1
+        fi
+
+    - name: Azure OIDC Auth
+      uses: azure/login@v2
+      with:
+        client-id: ${{ inputs.client_id }}
+        tenant-id: ${{ inputs.tenant_id }}
+        subscription-id: ${{ inputs.subscription_id }}

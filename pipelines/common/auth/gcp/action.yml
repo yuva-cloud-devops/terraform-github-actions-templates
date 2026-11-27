@@ -1,0 +1,24 @@
+name: "Auth GCP"
+description: "Workload Identity Federation for Google Cloud"
+inputs:
+  workload_identity_provider:
+    required: true
+  service_account:
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate GCP Credentials
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.workload_identity_provider }}" ] || [ -z "${{ inputs.service_account }}" ]; then
+          echo "::error::GCP_WIF_PROVIDER or GCP_SERVICE_ACCOUNT secret is missing or empty."
+          exit 1
+        fi
+
+    - name: Google Cloud OIDC Auth
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ inputs.workload_identity_provider }}
+        service_account: ${{ inputs.service_account }}

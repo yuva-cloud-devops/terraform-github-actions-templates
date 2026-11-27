@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TerraformDeploymentRequest",
+  "type": "object",
+  "properties": {
+    "environment": {
+      "type": "string",
+      "enum": ["dev", "uat", "prod"]
+    },
+    "cloud_provider": {
+      "type": "string",
+      "enum": ["gcp", "aws", "azure"]
+    },
+    "configuration": {
+      "type": "string",
+      "description": "Config file name under environments/<env>/ e.g. compute.yaml, network.yaml, storage.yaml"
+    },
+    "stack": {
+      "type": "string",
+      "description": "Stack directory e.g. compute-infrastructure, infrastructure/network"
+    },
+    "auto_approve": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": ["environment", "cloud_provider"]
+}

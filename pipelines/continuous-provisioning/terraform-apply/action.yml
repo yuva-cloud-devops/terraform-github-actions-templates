@@ -1,0 +1,143 @@
+name: "Terraform Apply"
+description: "Generates backend.hcl dynamically and executes terraform apply with resilient audit reporting"
+inputs:
+  cloud_provider:
+    required: true
+  environment:
+    required: true
+  working_directory:
+    required: false
+    default: "."
+  config_file:
+    description: "Optional environment config filename (e.g. compute.yaml)"
+    required: false
+    default: ""
+  state_bucket:
+    description: "Optional state bucket name override"
+    required: false
+    default: ""
+outputs:
+  report_path:
+    description: "Path to apply summary report"
+    value: ${{ steps.report.outputs.report_path }}
+  exitcode:
+    description: "Terraform apply exit code"
+    value: ${{ steps.apply.outputs.exitcode }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Generate backend.hcl, Init & Terraform Apply
+      id: apply
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        CLOUD: ${{ inputs.cloud_provider }}
+        ENV: ${{ inputs.environment }}
+        STACK_PATH: ${{ inputs.working_directory }}
+        CONFIG_FILE_INPUT: ${{ inputs.config_file }}
+        STATE_BUCKET_OVERRIDE: ${{ inputs.state_bucket }}
+        TF_VAR_environment: ${{ inputs.environment }}
+      run: |
+        set +e
+        if [ -n "$CONFIG_FILE_INPUT" ]; then
+          if [ -f "${GITHUB_WORKSPACE}/environments/${ENV}/${CONFIG_FILE_INPUT}" ]; then
+            export TF_VAR_config_file="${GITHUB_WORKSPACE}/environments/${ENV}/${CONFIG_FILE_INPUT}"
+          elif [ -f "environments/${ENV}/${CONFIG_FILE_INPUT}" ]; then
+            export TF_VAR_config_file="$(pwd)/environments/${ENV}/${CONFIG_FILE_INPUT}"
+          fi
+        fi
+        if [ "$STACK_PATH" = "." ] || [ -z "$STACK_PATH" ]; then
+          STACK_NAME=$(basename "$(pwd)")
+        else
+          STACK_NAME="${STACK_PATH#./}"
+          STACK_NAME="${STACK_NAME%/}"
+        fi
+        AZURE_KEY=$(echo "${ENV}-${STACK_NAME}.tfstate" | tr '/' '-')
+
+        case "$CLOUD" in
+          gcp)
+            BUCKET="${STATE_BUCKET_OVERRIDE:-${ENV}-tfstate-bucket}"
+            cat > backend.hcl <<EOF
+        bucket = "${BUCKET}"
+        prefix = "${ENV}/${STACK_NAME}"
+        EOF
+            ;;
+          aws)
+            BUCKET="${STATE_BUCKET_OVERRIDE:-org-terraform-state-${ENV}}"
+            cat > backend.hcl <<EOF
+        bucket         = "${BUCKET}"
+        key            = "${ENV}/${STACK_NAME}/terraform.tfstate"
+        dynamodb_table = "tf-locks-${ENV}"
+        EOF
+            ;;
+          azure)
+            STORAGE_ACCT="${STATE_BUCKET_OVERRIDE:-sttfstate${ENV}}"
+            cat > backend.hcl <<EOF
+        resource_group_name  = "rg-tfstate-${ENV}"
+        storage_account_name = "${STORAGE_ACCT}"
+        container_name       = "tfstate"
+        key                  = "${AZURE_KEY}"
+        EOF
+            ;;
+          *)
+            echo "::error::Unsupported cloud provider: $CLOUD" | tee apply.log
+            echo "exitcode=1" >> "$GITHUB_OUTPUT"
+            exit 0
+            ;;
+        esac
+
+        echo "=== Generated backend.hcl (${CLOUD} | ${ENV} | ${STACK_NAME}) ==="
+        cat backend.hcl
+        echo "================================================================="
+
+        terraform init -input=false -reconfigure -backend-config=backend.hcl > apply.log 2>&1
+        INIT_EXIT=$?
+        if [ $INIT_EXIT -ne 0 ]; then
+          cat apply.log
+          echo "::error::Terraform init failed with exit code $INIT_EXIT"
+          echo "exitcode=$INIT_EXIT" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        EXTRA_ARGS=""
+        if [ -f "environments/${ENV}.tfvars" ]; then
+          EXTRA_ARGS="-var-file=environments/${ENV}.tfvars"
+        elif [ -f "environments/${ENV}.tfvars.json" ]; then
+          EXTRA_ARGS="-var-file=environments/${ENV}.tfvars.json"
+        fi
+
+        terraform apply -input=false -auto-approve -no-color $EXTRA_ARGS >> apply.log 2>&1
+        APPLY_EXIT=$?
+        cat apply.log
+        echo "exitcode=$APPLY_EXIT" >> "$GITHUB_OUTPUT"
+        set -e
+
+    - name: Generate Apply Markdown Report
+      id: report
+      if: always()
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        APPLY_EXIT: ${{ steps.apply.outputs.exitcode }}
+        STACK_PATH: ${{ inputs.working_directory }}
+      run: |
+        GEN_SCRIPT="${{ github.action_path }}/../../../scripts/generate-apply-report.js"
+        if [ ! -f "$GEN_SCRIPT" ]; then
+          GEN_SCRIPT=".github-templates/scripts/generate-apply-report.js"
+        fi
+
+        node "$GEN_SCRIPT" \
+          --log apply.log \
+          --env "${{ inputs.environment }}" \
+          --cloud "${{ inputs.cloud_provider }}" \
+          --stack "${STACK_PATH}" \
+          --exitcode "${APPLY_EXIT:-1}" \
+          --out apply-report.md
+
+        echo "report_path=$(pwd)/apply-report.md" >> "$GITHUB_OUTPUT"
+
+        if [ "${APPLY_EXIT:-1}" -ne 0 ]; then
+          echo "::error::Terraform apply failed with exit code ${APPLY_EXIT:-1}"
+          exit "${APPLY_EXIT:-1}"
+        fi

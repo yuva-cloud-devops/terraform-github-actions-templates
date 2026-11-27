@@ -1,0 +1,47 @@
+name: "Parse PR Metadata"
+description: "Detects modified stacks, target environment, configuration file, and flags"
+inputs:
+  default_env:
+    description: "Fallback environment"
+    required: false
+    default: "dev"
+  working_dir:
+    description: "Working directory base"
+    required: false
+    default: "."
+outputs:
+  target_env:
+    description: "Resolved environment"
+    value: ${{ steps.parse.outputs.target_env }}
+  config_file:
+    description: "Resolved configuration filename (e.g. compute.yaml)"
+    value: ${{ steps.parse.outputs.config_file }}
+  changed_stacks:
+    description: "JSON array of changed stack paths"
+    value: ${{ steps.parse.outputs.changed_stacks }}
+  skip_ci:
+    description: "Skip CI flag"
+    value: ${{ steps.parse.outputs.skip_ci }}
+  deploy_description:
+    description: "Deployment description from PR metadata"
+    value: ${{ steps.parse.outputs.deploy_description }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Parse Metadata via Shell
+      id: parse
+      shell: bash
+      env:
+        DEFAULT_ENV: ${{ inputs.default_env }}
+        WORKING_DIR: ${{ inputs.working_dir }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+        COMMIT_MSG: ${{ github.event.head_commit.message }}
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        SCRIPT_PATH="${{ github.action_path }}/../../../scripts/parse-pr-metadata.sh"
+        if [ ! -f "$SCRIPT_PATH" ]; then
+          SCRIPT_PATH=".github-templates/scripts/parse-pr-metadata.sh"
+        fi
+        bash "$SCRIPT_PATH"

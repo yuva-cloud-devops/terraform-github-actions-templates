@@ -1,0 +1,59 @@
+name: "Security & Static Analysis"
+description: "Runs Trivy Secret/IaC Scan, TFLint, and Checkov"
+inputs:
+  working_directory:
+    required: false
+    default: "."
+  github_token:
+    required: true
+  fail_on_issues:
+    description: "Fail pipeline when HIGH/CRITICAL security findings are detected"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run Trivy IaC Config Scan
+      uses: aquasecurity/trivy-action@0.29.0
+      continue-on-error: ${{ inputs.fail_on_issues != 'true' }}
+      with:
+        scan-type: "config"
+        scan-ref: ${{ inputs.working_directory }}
+        severity: "HIGH,CRITICAL"
+        exit-code: ${{ inputs.fail_on_issues == 'true' && '1' || '0' }}
+
+    - name: Run Trivy Secret Filesystem Scan
+      uses: aquasecurity/trivy-action@0.29.0
+      continue-on-error: ${{ inputs.fail_on_issues != 'true' }}
+      with:
+        scan-type: "fs"
+        scanners: "secret"
+        scan-ref: ${{ inputs.working_directory }}
+        exit-code: ${{ inputs.fail_on_issues == 'true' && '1' || '0' }}
+
+    - name: Setup TFLint
+      uses: terraform-linters/setup-tflint@v4
+      with:
+        tflint_version: "latest"
+
+    - name: Run TFLint
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        FAIL_ON_ISSUES: ${{ inputs.fail_on_issues }}
+      run: |
+        tflint --init || true
+        if [ "$FAIL_ON_ISSUES" = "true" ]; then
+          tflint -f compact
+        else
+          tflint -f compact || echo "::warning::TFLint reported warnings/issues in ${{ inputs.working_directory }}"
+        fi
+
+    - name: Run Checkov Policy Scan
+      uses: bridgecrewio/checkov-action@v12
+      with:
+        directory: ${{ inputs.working_directory }}
+        framework: terraform
+        soft_fail: ${{ inputs.fail_on_issues != 'true' }}
+        output_format: cli

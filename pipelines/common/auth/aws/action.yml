@@ -1,0 +1,25 @@
+name: "Auth AWS"
+description: "AssumeRoleWithWebIdentity for Amazon Web Services"
+inputs:
+  role_to_assume:
+    required: true
+  aws_region:
+    required: false
+    default: "ap-south-1"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate AWS Role
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.role_to_assume }}" ]; then
+          echo "::error::AWS_ROLE_ARN secret is missing or empty."
+          exit 1
+        fi
+
+    - name: AWS OIDC Auth
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role_to_assume }}
+        aws-region: ${{ inputs.aws_region }}

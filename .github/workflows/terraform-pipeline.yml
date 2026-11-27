@@ -1,0 +1,281 @@
+name: Unified Terraform Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      cloud_provider:
+        description: "Target cloud provider (gcp | aws | azure)"
+        required: true
+        type: string
+      terraform_version:
+        description: "Terraform version to use"
+        required: false
+        type: string
+        default: "1.10.5"
+      environment:
+        description: "Fallback environment if not detected from PR/commit"
+        required: false
+        type: string
+        default: "dev"
+      working_directory:
+        description: "Fallback stack directory if not detected from PR/commit"
+        required: false
+        type: string
+        default: "."
+      state_bucket:
+        description: "Optional state bucket override (e.g. my-org-tfstate-dev)"
+        required: false
+        type: string
+        default: ""
+      enable_security_scans:
+        description: "Run Trivy, Checkov, and TFLint on PRs"
+        required: false
+        type: boolean
+        default: true
+      fail_on_security_issues:
+        description: "Fail CI if security scanners detect HIGH/CRITICAL issues"
+        required: false
+        type: boolean
+        default: false
+      templates_repository:
+        description: "Centralized templates repository (owner/repo)"
+        required: false
+        type: string
+        default: "yuva-cloud-devops/terraform-github-actions-templates"
+      templates_ref:
+        description: "Branch, tag or SHA of templates repository"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      GCP_WIF_PROVIDER:
+        required: false
+      GCP_SERVICE_ACCOUNT:
+        required: false
+      AWS_ROLE_ARN:
+        required: false
+      AWS_REGION:
+        required: false
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        required: false
+      BOT_GITHUB_TOKEN:
+        required: false
+
+concurrency:
+  group: tf-pipeline-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # -------------------------------------------------------------------
+  # 1. Detect Target Environment & Stacks + Validate Request
+  # -------------------------------------------------------------------
+  detect:
+    name: Detect Targets & Validate
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.parse.outputs.target_env }}
+      config_file: ${{ steps.parse.outputs.config_file }}
+      stacks: ${{ steps.parse.outputs.changed_stacks }}
+      skip_ci: ${{ steps.parse.outputs.skip_ci }}
+    steps:
+      - name: Checkout Consumer Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Checkout Centralized Templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
+
+      - name: Parse PR / Commit Metadata
+        id: parse
+        uses: ./.github-templates/pipelines/continuous-integration/parse-pr-metadata
+        with:
+          default_env: ${{ inputs.environment }}
+          working_dir: ${{ inputs.working_directory }}
+
+      - name: Validate Schema & Stacks
+        if: steps.parse.outputs.skip_ci != 'true'
+        uses: ./.github-templates/pipelines/continuous-integration/validate-schema
+        with:
+          schema_path: .github-templates/schemas/deployment-request-schema.json
+          env_file: environments/${{ steps.parse.outputs.target_env }}.yaml
+          cloud_provider: ${{ inputs.cloud_provider }}
+          target_env: ${{ steps.parse.outputs.target_env }}
+          config_file: ${{ steps.parse.outputs.config_file }}
+          changed_stacks: ${{ steps.parse.outputs.changed_stacks }}
+
+  # -------------------------------------------------------------------
+  # 2. PR Phase: Security Scan + Terraform Plan + Sticky PR Comment
+  # -------------------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.stack }} - ${{ needs.detect.outputs.env }})
+    needs: [detect]
+    if: github.event_name == 'pull_request' && needs.detect.outputs.skip_ci != 'true' && needs.detect.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.detect.outputs.stacks) }}
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout Consumer Code
+        uses: actions/checkout@v4
+
+      - name: Checkout Centralized Templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
+
+      - name: Run Security Scans
+        if: inputs.enable_security_scans
+        uses: ./.github-templates/pipelines/continuous-integration/security-scan
+        with:
+          working_directory: ${{ matrix.stack }}
+          github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
+          fail_on_issues: ${{ inputs.fail_on_security_issues }}
+
+      - name: GCP Auth
+        if: inputs.cloud_provider == 'gcp'
+        uses: ./.github-templates/pipelines/common/auth/gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: AWS Auth
+        if: inputs.cloud_provider == 'aws'
+        uses: ./.github-templates/pipelines/common/auth/aws
+        with:
+          role_to_assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws_region: ${{ secrets.AWS_REGION || 'ap-south-1' }}
+
+      - name: Azure Auth
+        if: inputs.cloud_provider == 'azure'
+        uses: ./.github-templates/pipelines/common/auth/azure
+        with:
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Run Terraform Plan
+        id: tf_plan
+        uses: ./.github-templates/pipelines/continuous-integration/terraform-plan
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+          environment: ${{ needs.detect.outputs.env }}
+          working_directory: ${{ matrix.stack }}
+          config_file: ${{ needs.detect.outputs.config_file }}
+          state_bucket: ${{ inputs.state_bucket }}
+
+      - name: Sticky PR Bot Comment
+        if: always()
+        uses: ./.github-templates/pipelines/common/bot
+        with:
+          github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
+          mode: "plan"
+          environment: ${{ needs.detect.outputs.env }}
+          stack: ${{ matrix.stack }}
+          plan_exit_code: ${{ steps.tf_plan.outputs.exitcode }}
+          summary_report_path: ${{ steps.tf_plan.outputs.report_path }}
+
+  # -------------------------------------------------------------------
+  # 3. Merge Phase: Environment Gate + Terraform Apply + Audit Comment
+  # -------------------------------------------------------------------
+  apply:
+    name: Apply (${{ matrix.stack }} - ${{ needs.detect.outputs.env }})
+    needs: [detect]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect.outputs.skip_ci != 'true' && needs.detect.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.detect.outputs.env }} # dev = auto | uat/prod = approval gate
+    concurrency:
+      group: tf-apply-${{ inputs.cloud_provider }}-${{ needs.detect.outputs.env }}-${{ matrix.stack }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        stack: ${{ fromJson(needs.detect.outputs.stacks) }}
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout Consumer Code
+        uses: actions/checkout@v4
+
+      - name: Checkout Centralized Templates
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
+
+      - name: GCP Auth
+        if: inputs.cloud_provider == 'gcp'
+        uses: ./.github-templates/pipelines/common/auth/gcp
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: AWS Auth
+        if: inputs.cloud_provider == 'aws'
+        uses: ./.github-templates/pipelines/common/auth/aws
+        with:
+          role_to_assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws_region: ${{ secrets.AWS_REGION || 'ap-south-1' }}
+
+      - name: Azure Auth
+        if: inputs.cloud_provider == 'azure'
+        uses: ./.github-templates/pipelines/common/auth/azure
+        with:
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Run Terraform Apply
+        id: tf_apply
+        uses: ./.github-templates/pipelines/continuous-provisioning/terraform-apply
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+          environment: ${{ needs.detect.outputs.env }}
+          working_directory: ${{ matrix.stack }}
+          config_file: ${{ needs.detect.outputs.config_file }}
+          state_bucket: ${{ inputs.state_bucket }}
+
+      - name: Record Deployment Audit Log
+        if: always()
+        uses: ./.github-templates/pipelines/continuous-provisioning/deployment-audit
+        with:
+          github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
+          environment: ${{ needs.detect.outputs.env }}
+          stack: ${{ matrix.stack }}
+          apply_status: ${{ steps.tf_apply.outcome }}
+          report_path: ${{ steps.tf_apply.outputs.report_path }}
