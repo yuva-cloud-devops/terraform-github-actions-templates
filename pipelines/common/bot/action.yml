@@ -9,7 +9,7 @@ inputs:
   artifacts_dir:
     description: "Directory containing downloaded plan/security artifacts"
     required: false
-    default: ".ci-artifacts"
+    default: "ci-artifacts"
   summary_report_path:
     description: "Optional pre-generated markdown report path"
     required: false
@@ -55,6 +55,7 @@ runs:
             --artifacts "$ARTIFACTS_DIR" \
             --env "$TARGET_ENV" \
             --cloud "$CLOUD_PROVIDER" \
+            --stacks "$STACKS_JSON" \
             --sha "${COMMIT_SHA:0:7}" \
             --out "$FINAL_REPORT"
         fi

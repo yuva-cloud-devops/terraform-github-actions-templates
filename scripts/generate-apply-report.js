@@ -2,7 +2,7 @@
 
 /**
  * ==============================================================================
- * Terraform CD Deployment Audit Report Generator
+ * Dynamic Terraform CD Deployment Audit Report Generator
  * Aggregates applied layers, state paths, outputs.json, and provenance metadata
  * ==============================================================================
  */
@@ -27,6 +27,12 @@ function parseArgs() {
     }
   }
   return args;
+}
+
+function mdCell(str, maxLen = 400) {
+  let s = String(str ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim();
+  if (s.length > maxLen) s = s.substring(0, maxLen) + '...';
+  return s;
 }
 
 function findFilesRecursive(dir, filename) {
@@ -56,28 +62,35 @@ function formatStatePath(cloud, bucket, env, stackName) {
 
 function main() {
   const args = parseArgs();
-  const artifactsDir = args.artifacts || '.cd-artifacts';
-  const envRaw = args.env || 'dev';
+  const artifactsDir = args.artifacts || 'cd-artifacts';
+  const envRaw = args.env || 'unknown';
   const envName = envRaw.toUpperCase();
-  const cloud = (args.cloud || 'gcp').toLowerCase();
+  const cloud = (args.cloud || 'unknown').toLowerCase();
   const defaultBucket = args.bucket || `${envRaw}-tfstate-bucket`;
-  const commitSha = args.sha || 'latest';
+  const commitSha = args.sha || 'unknown';
   const runId = args.runid || 'N/A';
+  const actor = args.actor || 'github-actions';
+  const eventTrigger = args.event ? `${args.event} (${args.ref || 'main'})` : 'push (main)';
   const outputPath = args.out || 'final-apply-report.md';
 
-  const metaFiles = findFilesRecursive(artifactsDir, 'meta.json');
-  const layers = [];
+  const metaFiles = findFilesRecursive(artifactsDir, 'meta.json').sort((a, b) => {
+    const idxA = parseInt(path.basename(path.dirname(a)), 10);
+    const idxB = parseInt(path.basename(path.dirname(b)), 10);
+    if (!isNaN(idxA) && !isNaN(idxB)) return idxA - idxB;
+    return a.localeCompare(b);
+  });
 
+  const layers = [];
   for (const metaPath of metaFiles) {
     try {
       const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
       layers.push({
-        name: meta.stack || meta.dir || 'infrastructure',
+        name: meta.stack || meta.dir || path.basename(path.dirname(metaPath)),
         dir: path.dirname(metaPath),
         env: meta.env || envRaw,
         cloud: (meta.cloud || cloud).toLowerCase(),
         bucket: meta.bucket || defaultBucket,
-        exitcode: Number(meta.exitcode || 0)
+        exitcode: Number(meta.exitcode ?? 0)
       });
     } catch (e) {
       // skip malformed meta
@@ -90,11 +103,15 @@ function main() {
   const timestamp = new Date().toISOString();
 
   let commentBody = `## 🚀 Terraform CD Deployment Audit Report\n\n`;
-  commentBody += `| **Target Environment** | **Deployment Status** | **Applied Layers** | **Execution Trigger** |\n`;
-  commentBody += `| :---: | :---: | :---: | :---: |\n`;
-  commentBody += `| \`${envName}\` | ${statusBadge} | \`${infraPath}\` | Push / Merge to \`main\` |\n\n`;
+  commentBody += `| **Target Environment** | **Cloud** | **Deployment Status** | **Applied Layers** | **Execution Trigger** |\n`;
+  commentBody += `| :---: | :---: | :---: | :---: | :---: |\n`;
+  commentBody += `| \`${envName}\` | \`${cloud.toUpperCase()}\` | ${statusBadge} | \`${infraPath}\` | \`${eventTrigger}\` |\n\n`;
   commentBody += `---\n\n`;
   commentBody += `### 📦 Applied Infrastructure Layers\n\n`;
+
+  if (layers.length === 0) {
+    commentBody += `*No deployment artifacts were produced (check workflow logs).*\n\n`;
+  }
 
   for (const layer of layers) {
     const statePrefix = `${layer.env}/${layer.name}`;
@@ -113,7 +130,7 @@ function main() {
       continue;
     }
 
-    commentBody += `* **Status**: ✅ All resources successfully provisioned.\n\n`;
+    commentBody += `* **Status**: ✅ All resources successfully provisioned to ${layer.cloud.toUpperCase()}.\n\n`;
 
     if (fs.existsSync(outputFile)) {
       try {
@@ -123,8 +140,8 @@ function main() {
           commentBody += `<details open>\n<summary><b>Click to View Deployed Outputs (${outEntries.length} Outputs)</b></summary>\n\n`;
           commentBody += `| Output Name | Value |\n| :--- | :--- |\n`;
           for (const [key, obj] of outEntries) {
-            const valStr = typeof obj.value === 'object' ? JSON.stringify(obj.value) : String(obj.value);
-            commentBody += `| \`${key}\` | \`${valStr}\` |\n`;
+            const rawVal = typeof obj.value === 'object' ? JSON.stringify(obj.value) : String(obj.value);
+            commentBody += `| \`${key}\` | \`${mdCell(rawVal, 450)}\` |\n`;
           }
           commentBody += `\n</details>\n\n`;
         }
@@ -137,6 +154,7 @@ function main() {
   commentBody += `---\n\n`;
   commentBody += `### 📋 Audit & Provenance Metadata\n`;
   commentBody += `* **Merged PR**: \`#__PR_NUMBER__\`\n`;
+  commentBody += `* **Triggered By**: \`${actor}\`\n`;
   commentBody += `* **Commit SHA**: \`${commitSha}\`\n`;
   commentBody += `* **GitHub Run ID**: \`${runId}\`\n`;
   commentBody += `* **Deployment Timestamp**: \`${timestamp}\`\n`;

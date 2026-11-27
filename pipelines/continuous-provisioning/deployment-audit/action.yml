@@ -6,7 +6,7 @@ inputs:
   artifacts_dir:
     description: "Directory containing downloaded apply artifacts"
     required: false
-    default: ".cd-artifacts"
+    default: "cd-artifacts"
   environment:
     required: false
     default: "dev"
@@ -33,6 +33,9 @@ runs:
         REPO: ${{ github.repository }}
         COMMIT_SHA: ${{ github.sha }}
         RUN_ID: ${{ github.run_id }}
+        EVENT_NAME: ${{ github.event_name }}
+        REF_NAME: ${{ github.ref_name }}
+        ACTOR: ${{ github.actor }}
       run: |
         GEN_APPLY_SCRIPT="${{ github.action_path }}/../../../scripts/generate-apply-report.js"
         [ -f "$GEN_APPLY_SCRIPT" ] || GEN_APPLY_SCRIPT=".github-templates/scripts/generate-apply-report.js"
@@ -48,6 +51,9 @@ runs:
           --bucket "$STATE_BUCKET" \
           --sha "${COMMIT_SHA:0:7}" \
           --runid "$RUN_ID" \
+          --event "$EVENT_NAME" \
+          --ref "$REF_NAME" \
+          --actor "$ACTOR" \
           --out "$FINAL_REPORT"
 
         REPORT_PATH="$FINAL_REPORT" node "$POST_SCRIPT" || echo "::warning::Deployment audit logging completed with fallback notice."

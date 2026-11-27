@@ -2,8 +2,9 @@
 
 /**
  * ==============================================================================
- * Terraform Plan & Compliance Audit Report Generator
- * Parses Gitleaks, Trivy, Checkov, and per-layer tfplan.json artifacts
+ * Dynamic Terraform Plan & Compliance Audit Report Generator
+ * Zero static fallback content — parses real Gitleaks, Trivy, Checkov,
+ * and per-layer tfplan.json artifacts across GCP, AWS, and Azure.
  * ==============================================================================
  */
 
@@ -33,6 +34,12 @@ function stripAnsi(str) {
   return (str || '').replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
 }
 
+function mdCell(str, maxLen = 280) {
+  let s = String(str ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim();
+  if (s.length > maxLen) s = s.substring(0, maxLen) + '...';
+  return s;
+}
+
 function findFilesRecursive(dir, filename) {
   const results = [];
   if (!dir || !fs.existsSync(dir)) return results;
@@ -45,6 +52,86 @@ function findFilesRecursive(dir, filename) {
     }
   }
   return results;
+}
+
+function extractDynamicDetails(rc) {
+  const change = rc.change || {};
+  const actions = change.actions || [];
+  const after = change.after || {};
+  const before = change.before || {};
+  const afterUnknown = change.after_unknown || {};
+  const stateObj = Object.keys(after).length > 0 ? after : before;
+
+  const details = [];
+
+  // For updates, highlight exact changed attributes first
+  if (actions.includes('update')) {
+    const changedKeys = Object.keys(after).filter(k => JSON.stringify(before[k]) !== JSON.stringify(after[k]));
+    if (changedKeys.length > 0) {
+      details.push(`Changed: ${changedKeys.slice(0, 5).map(k => `\`${k}\``).join(', ')}${changedKeys.length > 5 ? ', ...' : ''}`);
+    }
+  }
+
+  // Common multi-cloud attributes (GCP, AWS, Azure) extracted dynamically when present
+  const candidateKeys = [
+    ['machine_type', 'Machine'],
+    ['instance_type', 'Instance'],
+    ['vm_size', 'VM Size'],
+    ['zone', 'Zone'],
+    ['availability_zone', 'AZ'],
+    ['region', 'Region'],
+    ['location', 'Location'],
+    ['ip_cidr_range', 'CIDR'],
+    ['cidr_block', 'CIDR'],
+    ['network', 'Network'],
+    ['vpc_id', 'VPC'],
+    ['virtual_network_name', 'VNet'],
+    ['routing_mode', 'Routing'],
+    ['private_ip_google_access', 'PGA'],
+    ['bucket', 'Bucket'],
+    ['storage_account_name', 'Storage'],
+    ['asn', 'ASN'],
+    ['type', 'Type'],
+    ['role', 'Role']
+  ];
+
+  for (const [key, label] of candidateKeys) {
+    if (stateObj[key] !== undefined && stateObj[key] !== null && stateObj[key] !== '') {
+      details.push(`${label}: \`${mdCell(stateObj[key], 60)}\``);
+    }
+    if (details.length >= 4) break;
+  }
+
+  if (Array.isArray(stateObj.network_interface) && stateObj.network_interface[0]) {
+    const ni = stateObj.network_interface[0];
+    const hasPublic = Array.isArray(ni.access_config) && ni.access_config.length > 0;
+    details.push(`Public IP: \`${hasPublic ? 'enabled' : 'private-only'}\``);
+  }
+
+  if (Array.isArray(stateObj.allow)) {
+    const ports = stateObj.allow.flatMap(a => a.ports || []).filter(Boolean).join(', ');
+    if (ports) details.push(`Ports: \`${mdCell(ports, 60)}\``);
+  }
+
+  if (Array.isArray(stateObj.source_ranges) && stateObj.source_ranges.length > 0) {
+    details.push(`Source: \`${mdCell(stateObj.source_ranges.join(', '), 80)}\``);
+  }
+
+  if (details.length === 0) {
+    const scalarEntries = Object.entries(stateObj)
+      .filter(([k, v]) => k !== 'id' && k !== 'name' && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') && String(v).length > 0 && String(v).length <= 40)
+      .slice(0, 3);
+    for (const [k, v] of scalarEntries) {
+      details.push(`${k}: \`${mdCell(v, 40)}\``);
+    }
+  }
+
+  if (details.length === 0 && Object.keys(afterUnknown).length > 0) {
+    const unknownKeys = Object.keys(afterUnknown).slice(0, 3).map(k => `\`${k}\``).join(', ');
+    details.push(`Computed: ${unknownKeys}`);
+  }
+
+  return details.join(', ') || '—';
 }
 
 function parseTerraformPlanJson(jsonPath) {
@@ -92,36 +179,12 @@ function parseTerraformPlanJson(jsonPath) {
     const stateObj = Object.keys(after).length > 0 ? after : before;
     const rName = stateObj.name || rc.name || rc.address.split('.').pop();
 
-    const details = [];
-    if (stateObj.machine_type) details.push(`Machine: \`${stateObj.machine_type}\``);
-    if (stateObj.zone) details.push(`Zone: \`${stateObj.zone}\``);
-    if (stateObj.ip_cidr_range) details.push(`CIDR: \`${stateObj.ip_cidr_range}\``);
-    if (stateObj.region) details.push(`Region: \`${stateObj.region}\``);
-    if (stateObj.private_ip_google_access !== undefined) details.push(`PGA: \`${stateObj.private_ip_google_access}\``);
-    if (stateObj.routing_mode) details.push(`Routing: \`${stateObj.routing_mode}\``);
-    if (stateObj.network) details.push(`Network: \`${stateObj.network}\``);
-    if (Array.isArray(stateObj.network_interface) && stateObj.network_interface[0]) {
-      const ni = stateObj.network_interface[0];
-      const hasPublic = Array.isArray(ni.access_config) && ni.access_config.length > 0;
-      details.push(`Public IP: \`${hasPublic ? 'enabled' : 'private-only'}\``);
-    }
-    if (stateObj.asn) details.push(`ASN: \`${stateObj.asn}\``);
-    if (stateObj.type) details.push(`Type: \`${stateObj.type}\``);
-
-    if (stateObj.allow && Array.isArray(stateObj.allow)) {
-      const ports = stateObj.allow.flatMap(a => a.ports || []).join(', ');
-      if (ports) details.push(`Ports: \`${ports}\``);
-    }
-    if (stateObj.source_ranges && stateObj.source_ranges.length > 0) {
-      details.push(`Source: \`${stateObj.source_ranges.join(', ')}\``);
-    }
-
     resources.push({
       action: actionLabel,
       type: rType,
       name: rName,
       address: rc.address,
-      details: details.join(', ') || 'Standard configuration'
+      details: extractDynamicDetails(rc)
     });
 
     const groupKey = `${actionLabel}|${rType}`;
@@ -142,7 +205,7 @@ function parseTerraformPlanJson(jsonPath) {
     if (out.after !== undefined && out.after !== null) {
       valStr = typeof out.after === 'object' ? JSON.stringify(out.after) : String(out.after);
     }
-    outputs.push({ action: op, name: key, value: valStr });
+    outputs.push({ action: op, name: key, value: mdCell(valStr, 250) });
   }
 
   return {
@@ -155,26 +218,35 @@ function parseTerraformPlanJson(jsonPath) {
 
 function main() {
   const args = parseArgs();
-  const artifactsDir = args.artifacts || '.ci-artifacts';
-  const envName = (args.env || 'dev').toUpperCase();
-  const commitSha = args.sha || 'latest';
+  const artifactsDir = args.artifacts || 'ci-artifacts';
+  const envName = (args.env || 'unknown').toUpperCase();
+  const cloudName = (args.cloud || 'unknown').toUpperCase();
+  const commitSha = args.sha || 'unknown';
   const outputPath = args.out || 'final-plan-report.md';
 
+  let requestedStacks = [];
+  try {
+    requestedStacks = JSON.parse(args.stacks || '[]');
+  } catch (e) {
+    requestedStacks = [];
+  }
+
   // --------------------------------------------------------------------------
-  // A. Security Reports (Gitleaks, Trivy, Checkov)
+  // A. Security Reports (Gitleaks, Trivy, Checkov) — Zero Static Fake Passes
   // --------------------------------------------------------------------------
   const gitleaksFiles = findFilesRecursive(artifactsDir, 'gitleaks_report.txt');
   const trivyFiles = findFilesRecursive(artifactsDir, 'trivy_report.txt');
   const checkovFiles = findFilesRecursive(artifactsDir, 'checkov_report.txt');
 
   // 1. Gitleaks
-  let gitleaksStatus = '✅ No hardcoded secrets detected';
-  let gitleaksDetail = 'No report available.';
-  let gitleaksBadge = '✅ PASSED';
+  let gitleaksStatus = '⏭️ Not executed / No report';
+  let gitleaksDetail = 'Gitleaks did not run or no report artifact was uploaded.';
+  let gitleaksBadge = '⏭️ SKIPPED';
+  let gitleaksWarn = false;
 
   if (gitleaksFiles.length > 0) {
-    const rawGl = stripAnsi(fs.readFileSync(gitleaksFiles[0], 'utf8'));
-    gitleaksDetail = rawGl.trim() || 'Clean';
+    const rawGl = stripAnsi(fs.readFileSync(gitleaksFiles[0], 'utf8')).trim();
+    gitleaksDetail = rawGl || 'Empty Gitleaks output.';
 
     if (/no leaks found/i.test(rawGl)) {
       gitleaksStatus = '✅ No hardcoded secrets detected';
@@ -187,50 +259,61 @@ function main() {
     } else if (/leaks? found/i.test(rawGl) || /Finding:/i.test(rawGl)) {
       gitleaksStatus = '❌ Secrets detected in codebase';
       gitleaksBadge = '❌ FAILED';
+      gitleaksWarn = true;
       gitleaksDetail = rawGl.split('\n').slice(0, 40).join('\n').trim();
+    } else {
+      gitleaksStatus = '⚠️ Scan completed (check log)';
+      gitleaksBadge = '⚠️ INFO';
     }
   }
 
   // 2. Trivy
-  let trivyStatus = '✅ 0 High/Critical vulnerabilities';
-  let trivyDetail = 'Clean (0 findings)';
-  let trivyBadge = '✅ PASSED';
+  let trivyStatus = '⏭️ Not executed / No report';
+  let trivyDetail = 'Trivy did not run or no report artifact was uploaded.';
+  let trivyBadge = '⏭️ SKIPPED';
+  let trivyWarn = false;
 
   if (trivyFiles.length > 0) {
-    const rawTr = stripAnsi(fs.readFileSync(trivyFiles[0], 'utf8'));
+    const rawTr = stripAnsi(fs.readFileSync(trivyFiles[0], 'utf8')).trim();
     if (/FATAL|unknown flag/i.test(rawTr)) {
       trivyStatus = '❌ Trivy execution error';
       trivyBadge = '❌ ERROR';
-      trivyDetail = rawTr.split('\n').slice(-10).join('\n').trim();
+      trivyWarn = true;
+      trivyDetail = rawTr.split('\n').slice(-15).join('\n').trim();
     } else {
-      const critMatch = rawTr.match(/CRITICAL:\s*(\d+)/);
-      const highMatch = rawTr.match(/HIGH:\s*(\d+)/);
-      const critCount = critMatch ? parseInt(critMatch[1], 10) : 0;
-      const highCount = highMatch ? parseInt(highMatch[1], 10) : 0;
+      const critMatches = [...rawTr.matchAll(/CRITICAL:\s*(\d+)/g)].map(m => parseInt(m[1], 10));
+      const highMatches = [...rawTr.matchAll(/HIGH:\s*(\d+)/g)].map(m => parseInt(m[1], 10));
+      const critCount = critMatches.reduce((a, b) => a + b, 0);
+      const highCount = highMatches.reduce((a, b) => a + b, 0);
 
       if (critCount > 0 || highCount > 0) {
-        trivyStatus = `⚠️ Vulnerabilities found: CRITICAL: ${critCount}, HIGH: ${highCount}`;
+        trivyStatus = `⚠️ Findings: CRITICAL: ${critCount}, HIGH: ${highCount}`;
         trivyBadge = '⚠️ WARNING';
+        trivyWarn = true;
+      } else {
+        trivyStatus = '✅ 0 High/Critical findings';
+        trivyBadge = '✅ PASSED';
       }
 
       const boxStart = rawTr.indexOf('Report Summary');
       if (boxStart !== -1) {
         const lines = rawTr.substring(boxStart).split('\n');
         const legendEnd = lines.findIndex(l => l.includes('Clean (no security findings detected)'));
-        trivyDetail = (legendEnd !== -1 ? lines.slice(0, legendEnd + 1) : lines.slice(0, 20)).join('\n').trim();
+        trivyDetail = (legendEnd !== -1 ? lines.slice(0, legendEnd + 1) : lines.slice(0, 25)).join('\n').trim();
       } else {
-        trivyDetail = rawTr.split('\n').slice(-20).join('\n').trim() || 'Clean (0 findings)';
+        trivyDetail = rawTr.split('\n').slice(-25).join('\n').trim() || 'Scan completed.';
       }
     }
   }
 
-  // 3. Checkov
+  // 3. Checkov (supports CKV_ and CKV2_ across all clouds, deduplicated)
   const passedChecks = [];
   const failedChecks = [];
+  const seenKeys = new Set();
 
   for (const ckFile of checkovFiles) {
     const rawCk = stripAnsi(fs.readFileSync(ckFile, 'utf8'));
-    const checkBlocks = rawCk.split(/(?=Check:\s*CKV_)/);
+    const checkBlocks = rawCk.split(/(?=Check:\s*CKV2?_)/);
 
     for (const block of checkBlocks) {
       if (!block.startsWith('Check:')) continue;
@@ -251,14 +334,17 @@ function main() {
       const fileMatch = block.match(/File:\s*([^\n\r]+)/);
       if (fileMatch) file = fileMatch[1].trim();
 
+      const guideMatch = block.match(/Guide:\s*(https?:\/\/[^\s\n\r]+)/);
+      const guideUrl = guideMatch ? `[Checkov Guide](${guideMatch[1]})` : 'Review policy documentation';
+
+      const dedupeKey = `${checkId}|${resource}|${file}`;
+      if (seenKeys.has(dedupeKey)) continue;
+      seenKeys.add(dedupeKey);
+
       if (isPassed) {
         passedChecks.push({ id: checkId, desc: checkDesc, resource, file });
       } else if (isFailed) {
-        let fix = 'Review CIS benchmark recommendation';
-        if (checkId === 'CKV_TF_1') {
-          fix = 'Supply chain policy: Replace `version = "~> ..."` with Git commit hash, or add `--skip-check CKV_TF_1` in CI';
-        }
-        failedChecks.push({ id: checkId, desc: checkDesc, resource, file, fix });
+        failedChecks.push({ id: checkId, desc: checkDesc, resource, file, fix: guideUrl });
       }
     }
   }
@@ -266,78 +352,99 @@ function main() {
   const totalPassed = passedChecks.length;
   const totalFailed = failedChecks.length;
 
-  let checkovStatus = `✅ All checks passed (${totalPassed} passed)`;
-  let checkovBadge = `✅ ${totalPassed} PASSED`;
+  let checkovStatus = '⏭️ Not executed / No report';
+  let checkovBadge = '⏭️ SKIPPED';
+  let checkovWarn = false;
 
-  if (totalFailed > 0) {
-    checkovStatus = `⚠️ Policy issues: Passed: ${totalPassed}, Failed: ${totalFailed}`;
-    checkovBadge = `⚠️ ${totalPassed} PASSED / ${totalFailed} FAILED`;
+  if (checkovFiles.length > 0) {
+    if (totalFailed > 0) {
+      checkovStatus = `⚠️ Policy issues: Passed: ${totalPassed}, Failed: ${totalFailed}`;
+      checkovBadge = `⚠️ ${totalPassed} PASSED / ${totalFailed} FAILED`;
+      checkovWarn = true;
+    } else {
+      checkovStatus = `✅ All checks passed (${totalPassed} passed)`;
+      checkovBadge = `✅ ${totalPassed} PASSED`;
+    }
   }
 
-  const hasAnyWarnings = totalFailed > 0 || gitleaksBadge.includes('FAIL') || trivyBadge.includes('WARN') || trivyBadge.includes('ERROR');
+  const anySecurityRan = gitleaksFiles.length > 0 || trivyFiles.length > 0 || checkovFiles.length > 0;
+  const hasAnyWarnings = gitleaksWarn || trivyWarn || checkovWarn;
+  const securityHeaderBadge = !anySecurityRan
+    ? '⏭️ Scans Skipped'
+    : (hasAnyWarnings ? '⚠️ Security Warnings' : '✅ All Passed');
 
   // --------------------------------------------------------------------------
-  // B. Collect Per-Layer Plans
+  // B. Collect Per-Layer Plans (Sorted Numerically in Execution Order)
   // --------------------------------------------------------------------------
-  const metaFiles = findFilesRecursive(artifactsDir, 'meta.json');
+  const metaFiles = findFilesRecursive(artifactsDir, 'meta.json').sort((a, b) => {
+    const idxA = parseInt(path.basename(path.dirname(a)), 10);
+    const idxB = parseInt(path.basename(path.dirname(b)), 10);
+    if (!isNaN(idxA) && !isNaN(idxB)) return idxA - idxB;
+    return a.localeCompare(b);
+  });
+
   const layers = [];
-
   for (const metaPath of metaFiles) {
     try {
       const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-      const layerDir = path.dirname(metaPath);
       layers.push({
-        name: meta.stack || meta.dir || 'infrastructure',
-        dir: layerDir,
-        exitcode: Number(meta.exitcode || 0)
+        name: meta.stack || meta.dir || path.basename(path.dirname(metaPath)),
+        dir: path.dirname(metaPath),
+        exitcode: Number(meta.exitcode ?? 0)
       });
     } catch (e) {
       // skip malformed meta
     }
   }
 
-  const infraNames = layers.map(l => l.name).join(', ') || 'none';
+  const infraNames = layers.length > 0
+    ? layers.map(l => l.name).join(', ')
+    : (requestedStacks.length > 0 ? requestedStacks.join(', ') : 'none');
+
   const anyPlanFailed = layers.some(l => l.exitcode === 1);
-  const pipelineStatus = anyPlanFailed ? '🔴 **PLAN FAILED**' : '🟢 **PLAN GENERATED**';
+  let pipelineStatus = '🟢 **PLAN GENERATED**';
+  if (layers.length === 0) {
+    pipelineStatus = '⚠️ **NO PLAN PRODUCED**';
+  } else if (anyPlanFailed) {
+    pipelineStatus = '🔴 **PLAN FAILED**';
+  }
 
   // --------------------------------------------------------------------------
-  // C. Build Consolidated Markdown Report
+  // C. Build Dynamic Consolidated Markdown Report
   // --------------------------------------------------------------------------
   let commentBody = `## 🤖 Terraform Plan & Compliance Audit Report\n\n`;
-  commentBody += `| **Target Environment** | **Infrastructure Scope** | **Security Checks** | **Pipeline Status** |\n`;
-  commentBody += `| :---: | :---: | :---: | :---: |\n`;
-  commentBody += `| \`${envName}\` | \`${infraNames}\` | ${hasAnyWarnings ? '⚠️ Security Warnings' : '✅ All Passed'} | ${pipelineStatus} |\n\n`;
+  commentBody += `| **Target Environment** | **Cloud** | **Infrastructure Scope** | **Security Checks** | **Pipeline Status** |\n`;
+  commentBody += `| :---: | :---: | :---: | :---: | :---: |\n`;
+  commentBody += `| \`${envName}\` | \`${cloudName}\` | \`${infraNames}\` | ${securityHeaderBadge} | ${pipelineStatus} |\n\n`;
   commentBody += `---\n\n`;
 
-  // 1. Security Summary
   commentBody += `### 🛡️ Security & Compliance Audit\n\n`;
   commentBody += `| Security Tool | Scope | Status / Finding |\n`;
   commentBody += `| :--- | :--- | :--- |\n`;
   commentBody += `| **Gitleaks** | Repository Commits & Files | ${gitleaksStatus} |\n`;
   commentBody += `| **Trivy** | Vulnerabilities & Misconfigurations | ${trivyStatus} |\n`;
-  commentBody += `| **Checkov** | IaC Policies & Best Practices | ${checkovStatus} |\n\n`;
+  commentBody += `| **Checkov** | ${cloudName} IaC Policies & Best Practices | ${checkovStatus} |\n\n`;
 
   commentBody += `<details>\n<summary><b>🔍 View Security Scans Output & Remediation Guide</b></summary>\n\n`;
   commentBody += `#### 1️⃣ Gitleaks Scan — \`${gitleaksBadge}\`\n\`\`\`text\n${gitleaksDetail}\n\`\`\`\n\n`;
   commentBody += `#### 2️⃣ Trivy Scan — \`${trivyBadge}\`\n\`\`\`text\n${trivyDetail}\n\`\`\`\n\n`;
-  commentBody += `#### 3️⃣ Checkov CIS Policies — \`${checkovBadge}\`\n`;
+  commentBody += `#### 3️⃣ Checkov Policies — \`${checkovBadge}\`\n`;
   commentBody += `* **Passed Checks**: \`${totalPassed}\` policies verified.\n`;
 
   if (failedChecks.length > 0) {
     commentBody += `\n##### ❌ Failed Checks & Fixes (${failedChecks.length})\n\n`;
     commentBody += `| Check ID | Policy Description | Impacted Resource | File | Recommended Fix |\n| :--- | :--- | :--- | :--- | :--- |\n`;
     failedChecks.forEach(f => {
-      commentBody += `| **\`${f.id}\`** | ${f.desc} | \`${f.resource}\` | \`${f.file}\` | ${f.fix} |\n`;
+      commentBody += `| **\`${f.id}\`** | ${mdCell(f.desc, 140)} | \`${mdCell(f.resource, 80)}\` | \`${mdCell(f.file, 80)}\` | ${f.fix} |\n`;
     });
     commentBody += `\n`;
   }
   commentBody += `</details>\n\n---\n\n`;
 
-  // 2. Infrastructure Execution Plan
   commentBody += `### 📋 Infrastructure Execution Plan\n\n`;
 
   if (layers.length === 0) {
-    commentBody += `*No Terraform plan artifacts were produced.*\n\n`;
+    commentBody += `*No Terraform plan artifacts were produced (check earlier stage logs).*\n\n`;
   }
 
   for (const layer of layers) {
@@ -361,7 +468,7 @@ function main() {
       commentBody += `| Action | Resource Type | Count | Resource Name(s) |\n`;
       commentBody += `| :---: | :--- | :---: | :--- |\n`;
       parsed.grouped.forEach(g => {
-        const namesStr = g.names.map(n => `\`${n}\``).join(', ');
+        const namesStr = mdCell(g.names.map(n => `\`${n}\``).join(', '), 250);
         commentBody += `| ${g.action} | \`${g.type}\` | ${g.names.length} | ${namesStr} |\n`;
       });
       commentBody += `\n`;
@@ -370,7 +477,7 @@ function main() {
       commentBody += `| Action | Address | Key Attributes |\n`;
       commentBody += `| :---: | :--- | :--- |\n`;
       parsed.resources.forEach(r => {
-        commentBody += `| ${r.action} | \`${r.address}\` | ${r.details} |\n`;
+        commentBody += `| ${r.action} | \`${mdCell(r.address, 140)}\` | ${r.details} |\n`;
       });
       commentBody += `\n</details>\n\n`;
     }
