@@ -4,28 +4,21 @@ const https = require('https');
 
 const token = process.env.GITHUB_TOKEN;
 const repo = process.env.REPO;
-let prNumber = process.env.PR_NUMBER;
+const prNumberEnv = process.env.PR_NUMBER;
 const reportPath = process.env.REPORT_PATH;
 const mode = (process.env.MODE || 'PLAN').toUpperCase();
 const targetEnv = process.env.TARGET_ENV || 'default';
-const stackName = process.env.STACK_NAME || 'root';
 const commitSha = process.env.COMMIT_SHA || 'N/A';
 
 let content = '';
 if (reportPath && fs.existsSync(reportPath)) {
   content = fs.readFileSync(reportPath, 'utf8');
 } else {
-  content = `### Terraform ${mode} Report [\`${targetEnv}\` | \`${stackName}\`]\n\n- Commit: \`${commitSha}\`\n- Status: Completed (No explicit report file produced)`;
+  content = `### Terraform ${mode} Report [\`${targetEnv}\`]\n\n- Commit: \`${commitSha}\`\n- Status: Completed (No explicit report file produced)`;
 }
 
-const safeStackId = stackName.replace(/[^a-zA-Z0-9_-]/g, '_');
 const safeEnvId = targetEnv.replace(/[^a-zA-Z0-9_-]/g, '_');
-const commentIdentifier = `<!-- TF-CENTRAL-BOT-${mode}-${safeEnvId}-${safeStackId} -->`;
-
-let commentBody = `${commentIdentifier}\n${content}\n\n*Automated status posted by Centralized Terraform Bot • ${new Date().toISOString()}*`;
-if (commentBody.length > 64000) {
-  commentBody = commentBody.substring(0, 63950) + '\n\n...[TRUNCATED DUE TO GITHUB COMMENT LIMIT]';
-}
+const commentIdentifier = `<!-- TF-CENTRAL-BOT-${mode}-${safeEnvId} -->`;
 
 function githubRequest(path, method, body = null) {
   return new Promise((resolve, reject) => {
@@ -64,24 +57,48 @@ function githubRequest(path, method, body = null) {
 }
 
 async function resolveMergedPrNumber() {
-  if (prNumber && prNumber !== 'null' && prNumber !== 'undefined') {
-    return prNumber;
+  if (prNumberEnv && prNumberEnv !== 'null' && prNumberEnv !== 'undefined') {
+    return prNumberEnv;
   }
-  if (!commitSha || commitSha === 'N/A' || !repo) {
-    return null;
+  if (!repo) return null;
+
+  // 1. Lookup PR associated with the merge commit SHA
+  if (commitSha && commitSha !== 'N/A') {
+    try {
+      const res = await githubRequest(`/repos/${repo}/commits/${commitSha}/pulls`, 'GET');
+      if (res.statusCode === 200 && Array.isArray(res.data) && res.data.length > 0) {
+        return String(res.data[0].number);
+      }
+    } catch (e) {
+      console.warn("Could not resolve PR from commit:", e.message);
+    }
   }
+
+  // 2. Fallback: find most recently merged PR targeting main
   try {
-    const res = await githubRequest(`/repos/${repo}/commits/${commitSha}/pulls`, 'GET');
-    if (res.statusCode === 200 && Array.isArray(res.data) && res.data.length > 0) {
-      return String(res.data[0].number);
+    const res = await githubRequest(`/repos/${repo}/pulls?state=closed&base=main&sort=updated&direction=desc&per_page=5`, 'GET');
+    if (res.statusCode === 200 && Array.isArray(res.data)) {
+      const merged = res.data.find(p => p.merged_at);
+      if (merged) return String(merged.number);
     }
   } catch (e) {
-    console.warn("Could not resolve associated PR for commit:", e.message);
+    console.warn("Fallback merged PR lookup failed:", e.message);
   }
   return null;
 }
 
 async function run() {
+  const resolvedPr = await resolveMergedPrNumber();
+
+  // Fill in resolved PR number placeholder inside CD Audit metadata
+  content = content.replace(/__PR_NUMBER__/g, resolvedPr || 'N/A');
+
+  let commentBody = `${commentIdentifier}\n${content}`;
+  if (commentBody.length > 64000) {
+    commentBody = commentBody.substring(0, 63950) + '\n\n...[TRUNCATED DUE TO GITHUB COMMENT LIMIT]';
+  }
+
+  // Always write to GitHub Actions Step Summary
   const summaryFile = process.env.GITHUB_STEP_SUMMARY;
   if (summaryFile && fs.existsSync(summaryFile)) {
     try {
@@ -91,22 +108,31 @@ async function run() {
     }
   }
 
-  const resolvedPr = await resolveMergedPrNumber();
   if (!resolvedPr) {
     console.log("No Pull Request associated with this run. Output recorded in Actions Summary.");
     return;
   }
 
   try {
-    const commentsRes = await githubRequest(`/repos/${repo}/issues/${resolvedPr}/comments?per_page=100`, 'GET');
+    if (mode === 'APPLY') {
+      // CD posts a new Deployment Audit comment on the merged PR
+      console.log(`Posting CD Deployment Audit comment on merged PR #${resolvedPr}`);
+      const postRes = await githubRequest(`/repos/${repo}/issues/${resolvedPr}/comments`, 'POST', { body: commentBody });
+      if (postRes.statusCode >= 400) {
+        console.warn(`::warning::GitHub API returned status ${postRes.statusCode}: ${JSON.stringify(postRes.data)}`);
+      }
+      return;
+    }
 
+    // CI updates the sticky Plan & Compliance comment in place
+    const commentsRes = await githubRequest(`/repos/${repo}/issues/${resolvedPr}/comments?per_page=100`, 'GET');
     if (commentsRes.statusCode === 403 || commentsRes.statusCode === 401) {
       console.warn(`::warning::Bot lacks write permissions for PR #${resolvedPr}. Output logged to Actions Summary.`);
       return;
     }
 
     const existingComment = Array.isArray(commentsRes.data)
-      ? commentsRes.data.find(c => c.body && c.body.includes(commentIdentifier))
+      ? commentsRes.data.find(c => c.body && (c.body.includes(commentIdentifier) || c.body.includes('Terraform Plan & Compliance Audit Report')))
       : null;
 
     let writeRes;

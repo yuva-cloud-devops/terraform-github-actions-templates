@@ -1,46 +1,62 @@
 name: "GitHub Bot"
-description: "Posts or updates a sticky comment on PRs or records an audit summary"
+description: "Generates consolidated Plan & Compliance report and posts/updates sticky PR comment"
 inputs:
   github_token:
     required: true
   mode:
     description: "'plan' or 'apply'"
     required: true
+  artifacts_dir:
+    description: "Directory containing downloaded plan/security artifacts"
+    required: false
+    default: ".ci-artifacts"
   summary_report_path:
-    required: false
-    default: ""
-  plan_exit_code:
-    required: false
-    default: ""
-  apply_status:
+    description: "Optional pre-generated markdown report path"
     required: false
     default: ""
   environment:
     required: false
     default: "dev"
-  stack:
+  cloud_provider:
     required: false
-    default: "."
+    default: "gcp"
+  stacks:
+    required: false
+    default: "[]"
 
 runs:
   using: "composite"
   steps:
-    - name: Post or Update Sticky Comment
+    - name: Generate Report & Post Sticky Comment
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         MODE: ${{ inputs.mode }}
+        ARTIFACTS_DIR: ${{ inputs.artifacts_dir }}
         REPORT_PATH: ${{ inputs.summary_report_path }}
-        PLAN_EXIT_CODE: ${{ inputs.plan_exit_code }}
-        APPLY_STATUS: ${{ inputs.apply_status }}
         TARGET_ENV: ${{ inputs.environment }}
-        STACK_NAME: ${{ inputs.stack }}
+        CLOUD_PROVIDER: ${{ inputs.cloud_provider }}
+        STACKS_JSON: ${{ inputs.stacks }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
         COMMIT_SHA: ${{ github.sha }}
+        RUN_ID: ${{ github.run_id }}
       run: |
-        SCRIPT_PATH="${{ github.action_path }}/../../../scripts/post-comment.js"
-        if [ ! -f "$SCRIPT_PATH" ]; then
-          SCRIPT_PATH=".github-templates/scripts/post-comment.js"
+        GEN_PLAN_SCRIPT="${{ github.action_path }}/../../../scripts/generate-plan-report.js"
+        [ -f "$GEN_PLAN_SCRIPT" ] || GEN_PLAN_SCRIPT=".github-templates/scripts/generate-plan-report.js"
+
+        POST_SCRIPT="${{ github.action_path }}/../../../scripts/post-comment.js"
+        [ -f "$POST_SCRIPT" ] || POST_SCRIPT=".github-templates/scripts/post-comment.js"
+
+        FINAL_REPORT="$REPORT_PATH"
+        if [ "$MODE" = "plan" ] && [ -z "$FINAL_REPORT" ]; then
+          FINAL_REPORT="final-plan-report.md"
+          node "$GEN_PLAN_SCRIPT" \
+            --artifacts "$ARTIFACTS_DIR" \
+            --env "$TARGET_ENV" \
+            --cloud "$CLOUD_PROVIDER" \
+            --sha "${COMMIT_SHA:0:7}" \
+            --out "$FINAL_REPORT"
         fi
-        node "$SCRIPT_PATH" || echo "::warning::Bot comment posting completed with fallback notice."
+
+        REPORT_PATH="$FINAL_REPORT" node "$POST_SCRIPT" || echo "::warning::Bot comment posting completed with fallback notice."

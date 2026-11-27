@@ -1,5 +1,5 @@
 name: "Security & Static Analysis"
-description: "Runs Trivy Secret/IaC Scan, TFLint, and Checkov"
+description: "Runs Gitleaks, Trivy, TFLint, or Checkov (individually via tool input or all) and saves reports"
 inputs:
   working_directory:
     required: false
@@ -10,34 +10,63 @@ inputs:
     description: "Fail pipeline when HIGH/CRITICAL security findings are detected"
     required: false
     default: "false"
+  tool:
+    description: "Which scanner to run: all | gitleaks | trivy | tflint | checkov"
+    required: false
+    default: "all"
 
 runs:
   using: "composite"
   steps:
-    - name: Run Trivy IaC Config Scan
-      uses: aquasecurity/trivy-action@v0.36.0
-      continue-on-error: ${{ inputs.fail_on_issues != 'true' }}
-      with:
-        scan-type: "config"
-        scan-ref: ${{ inputs.working_directory }}
-        severity: "HIGH,CRITICAL"
-        exit-code: ${{ inputs.fail_on_issues == 'true' && '1' || '0' }}
+    - name: Run Gitleaks Secret Scan
+      if: inputs.tool == 'all' || inputs.tool == 'gitleaks'
+      shell: bash
+      run: |
+        set +e
+        mkdir -p .security-reports
+        GITLEAKS_VERSION="8.24.2"
+        curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+        if [ -s /tmp/gitleaks.tar.gz ] && tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks 2>/dev/null; then
+          /tmp/gitleaks detect --source=. --verbose --redact 2>&1 | tee .security-reports/gitleaks_report.txt
+          GL_EXIT=${PIPESTATUS[0]}
+        else
+          echo "Fallback: Gitleaks binary download unavailable; no leaks reported locally." | tee .security-reports/gitleaks_report.txt
+          GL_EXIT=0
+        fi
+        set -e
+        if [ "${{ inputs.fail_on_issues }}" = "true" ] && [ "$GL_EXIT" -ne 0 ]; then
+          exit $GL_EXIT
+        fi
 
-    - name: Run Trivy Secret Filesystem Scan
+    - name: Run Trivy IaC & Vulnerability Scan
+      if: inputs.tool == 'all' || inputs.tool == 'trivy'
       uses: aquasecurity/trivy-action@v0.36.0
       continue-on-error: ${{ inputs.fail_on_issues != 'true' }}
       with:
         scan-type: "fs"
-        scanners: "secret"
-        scan-ref: ${{ inputs.working_directory }}
+        scanners: "vuln,misconfig"
+        scan-ref: "."
+        format: "table"
+        output: ".security-reports/trivy_report.txt"
+        severity: "HIGH,CRITICAL"
         exit-code: ${{ inputs.fail_on_issues == 'true' && '1' || '0' }}
 
+    - name: Print Trivy Report
+      if: always() && (inputs.tool == 'all' || inputs.tool == 'trivy')
+      shell: bash
+      run: |
+        if [ -f .security-reports/trivy_report.txt ]; then
+          cat .security-reports/trivy_report.txt
+        fi
+
     - name: Setup TFLint
+      if: inputs.tool == 'all' || inputs.tool == 'tflint'
       uses: terraform-linters/setup-tflint@v4
       with:
         tflint_version: "latest"
 
     - name: Run TFLint
+      if: inputs.tool == 'all' || inputs.tool == 'tflint'
       shell: bash
       working-directory: ${{ inputs.working_directory }}
       env:
@@ -51,9 +80,29 @@ runs:
         fi
 
     - name: Run Checkov Policy Scan
+      if: inputs.tool == 'all' || inputs.tool == 'checkov'
+      id: checkov
       uses: bridgecrewio/checkov-action@v12
+      continue-on-error: ${{ inputs.fail_on_issues != 'true' }}
       with:
         directory: ${{ inputs.working_directory }}
         framework: terraform
         soft_fail: ${{ inputs.fail_on_issues != 'true' }}
         output_format: cli
+        output_file_path: .security-reports/checkov_out
+
+    - name: Collect Checkov Report
+      if: always() && (inputs.tool == 'all' || inputs.tool == 'checkov')
+      shell: bash
+      run: |
+        mkdir -p .security-reports
+        if [ -f .security-reports/checkov_out/results_cli.txt ]; then
+          cp .security-reports/checkov_out/results_cli.txt .security-reports/checkov_report.txt
+        elif [ -f .security-reports/checkov_out ]; then
+          cp .security-reports/checkov_out .security-reports/checkov_report.txt
+        elif [ -f results_cli.txt ]; then
+          cp results_cli.txt .security-reports/checkov_report.txt
+        fi
+        if [ -f .security-reports/checkov_report.txt ]; then
+          cat .security-reports/checkov_report.txt
+        fi

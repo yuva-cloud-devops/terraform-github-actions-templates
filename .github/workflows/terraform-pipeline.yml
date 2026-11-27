@@ -28,7 +28,7 @@ on:
         type: string
         default: ""
       enable_security_scans:
-        description: "Run Trivy, Checkov, and TFLint on PRs"
+        description: "Run Gitleaks, Trivy, Checkov, and TFLint on PRs"
         required: false
         type: boolean
         default: true
@@ -70,11 +70,11 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # -------------------------------------------------------------------
-  # 1. Detect Target Environment & Stacks + Validate Request
-  # -------------------------------------------------------------------
-  detect:
-    name: Detect Targets & Validate
+  # ===================================================================
+  # STAGE 1: Metadata Parsing & Schema Validation Gate (Sequential)
+  # ===================================================================
+  parse-pr-metadata:
+    name: 1. Parse PR Metadata
     runs-on: ubuntu-latest
     outputs:
       env: ${{ steps.parse.outputs.target_env }}
@@ -95,40 +95,18 @@ jobs:
           path: .github-templates
           fetch-depth: 1
 
-      - name: Parse PR / Commit Metadata
+      - name: Run Parse PR Metadata
         id: parse
         uses: ./.github-templates/pipelines/continuous-integration/parse-pr-metadata
         with:
           default_env: ${{ inputs.environment }}
           working_dir: ${{ inputs.working_directory }}
 
-      - name: Validate Schema & Stacks
-        if: steps.parse.outputs.skip_ci != 'true'
-        uses: ./.github-templates/pipelines/continuous-integration/validate-schema
-        with:
-          schema_path: .github-templates/schemas/deployment-request-schema.json
-          env_file: environments/${{ steps.parse.outputs.target_env }}.yaml
-          cloud_provider: ${{ inputs.cloud_provider }}
-          target_env: ${{ steps.parse.outputs.target_env }}
-          config_file: ${{ steps.parse.outputs.config_file }}
-          changed_stacks: ${{ steps.parse.outputs.changed_stacks }}
-
-  # -------------------------------------------------------------------
-  # 2. PR Phase: Security Scan + Terraform Plan + Sticky PR Comment
-  # -------------------------------------------------------------------
-  plan:
-    name: Plan (${{ matrix.stack }} - ${{ needs.detect.outputs.env }})
-    needs: [detect]
-    if: github.event_name == 'pull_request' && needs.detect.outputs.skip_ci != 'true' && needs.detect.outputs.stacks != '[]'
+  validate-schema:
+    name: 2. Validate Config & Schema
+    needs: [parse-pr-metadata]
+    if: needs.parse-pr-metadata.outputs.skip_ci != 'true'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        stack: ${{ fromJson(needs.detect.outputs.stacks) }}
-    permissions:
-      id-token: write
-      contents: read
-      pull-requests: write
     steps:
       - name: Checkout Consumer Code
         uses: actions/checkout@v4
@@ -141,13 +119,213 @@ jobs:
           path: .github-templates
           fetch-depth: 1
 
-      - name: Run Security Scans
-        if: inputs.enable_security_scans
-        uses: ./.github-templates/pipelines/continuous-integration/security-scan
+      - name: Run Validate Schema
+        uses: ./.github-templates/pipelines/continuous-integration/validate-schema
         with:
+          schema_path: .github-templates/schemas/deployment-request-schema.json
+          env_file: environments/${{ needs.parse-pr-metadata.outputs.env }}.yaml
+          cloud_provider: ${{ inputs.cloud_provider }}
+          target_env: ${{ needs.parse-pr-metadata.outputs.env }}
+          config_file: ${{ needs.parse-pr-metadata.outputs.config_file }}
+          changed_stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
+
+  # ===================================================================
+  # STAGE 2 (PR): Dedicated Quality & Security Jobs (Parallel Fan-Out)
+  # ===================================================================
+  terraform-fmt:
+    name: 3a. Terraform Format (${{ matrix.stack }})
+    needs: [parse-pr-metadata, validate-schema]
+    if: github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+      - name: Check Terraform Formatting
+        working-directory: ${{ matrix.stack }}
+        run: terraform fmt -check -recursive
+
+  terraform-validate:
+    name: 3b. Terraform Validate (${{ matrix.stack }})
+    needs: [parse-pr-metadata, validate-schema]
+    if: github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+      - name: Init (No Backend) & Validate
+        working-directory: ${{ matrix.stack }}
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+
+  gitleaks-scan:
+    name: 3c. Gitleaks Secret Scan
+    needs: [parse-pr-metadata, validate-schema]
+    if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
+      - uses: ./.github-templates/pipelines/continuous-integration/security-scan
+        with:
+          tool: "gitleaks"
+          github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
+          fail_on_issues: ${{ inputs.fail_on_security_issues }}
+      - name: Upload Gitleaks Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: .security-reports/gitleaks_report.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+  trivy-scan:
+    name: 3d. Trivy Vulnerability Scan
+    needs: [parse-pr-metadata, validate-schema]
+    if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
+      - uses: ./.github-templates/pipelines/continuous-integration/security-scan
+        with:
+          tool: "trivy"
+          github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
+          fail_on_issues: ${{ inputs.fail_on_security_issues }}
+      - name: Upload Trivy Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: .security-reports/trivy_report.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+  tflint-check:
+    name: 3e. TFLint (${{ matrix.stack }})
+    needs: [parse-pr-metadata, validate-schema]
+    if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
+      - uses: ./.github-templates/pipelines/continuous-integration/security-scan
+        with:
+          tool: "tflint"
           working_directory: ${{ matrix.stack }}
           github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
           fail_on_issues: ${{ inputs.fail_on_security_issues }}
+
+  checkov-scan:
+    name: 3f. Checkov CIS Scan (${{ matrix.stack }})
+    needs: [parse-pr-metadata, validate-schema]
+    if: github.event_name == 'pull_request' && inputs.enable_security_scans && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
+      - uses: ./.github-templates/pipelines/continuous-integration/security-scan
+        with:
+          tool: "checkov"
+          working_directory: ${{ matrix.stack }}
+          github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
+          fail_on_issues: ${{ inputs.fail_on_security_issues }}
+      - name: Upload Checkov Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-report-${{ strategy.job-index }}
+          path: .security-reports/checkov_report.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ===================================================================
+  # STAGE 3 (PR): Terraform Plan
+  # ===================================================================
+  terraform-plan:
+    name: 4. Terraform Plan (${{ matrix.stack }})
+    needs:
+      - parse-pr-metadata
+      - validate-schema
+      - terraform-fmt
+      - terraform-validate
+      - gitleaks-scan
+      - trivy-scan
+      - tflint-check
+      - checkov-scan
+    if: >-
+      always()
+      && github.event_name == 'pull_request'
+      && needs.parse-pr-metadata.outputs.skip_ci != 'true'
+      && needs.parse-pr-metadata.outputs.stacks != '[]'
+      && needs.validate-schema.result == 'success'
+      && needs.terraform-fmt.result == 'success'
+      && needs.terraform-validate.result == 'success'
+      && (needs.gitleaks-scan.result == 'success' || needs.gitleaks-scan.result == 'skipped')
+      && (needs.trivy-scan.result == 'success' || needs.trivy-scan.result == 'skipped')
+      && (needs.tflint-check.result == 'success' || needs.tflint-check.result == 'skipped')
+      && (needs.checkov-scan.result == 'success' || needs.checkov-scan.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
 
       - name: GCP Auth
         if: inputs.cloud_provider == 'gcp'
@@ -182,50 +360,85 @@ jobs:
         uses: ./.github-templates/pipelines/continuous-integration/terraform-plan
         with:
           cloud_provider: ${{ inputs.cloud_provider }}
-          environment: ${{ needs.detect.outputs.env }}
+          environment: ${{ needs.parse-pr-metadata.outputs.env }}
           working_directory: ${{ matrix.stack }}
-          config_file: ${{ needs.detect.outputs.config_file }}
+          config_file: ${{ needs.parse-pr-metadata.outputs.config_file }}
           state_bucket: ${{ inputs.state_bucket }}
+          skip_fmt_validate: "true"
 
-      - name: Sticky PR Bot Comment
-        if: always()
+      - name: Upload Plan Outputs Artifact
+        if: always() && steps.tf_plan.outputs.report_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-outputs-${{ strategy.job-index }}
+          path: ${{ steps.tf_plan.outputs.report_path }}/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ===================================================================
+  # STAGE 4 (PR): Consolidated PR Plan & Compliance Audit Bot
+  # ===================================================================
+  pr-bot-comment:
+    name: 5. PR Plan & Compliance Bot
+    needs:
+      - parse-pr-metadata
+      - validate-schema
+      - gitleaks-scan
+      - trivy-scan
+      - checkov-scan
+      - terraform-plan
+    if: always() && github.event_name == 'pull_request' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.validate-schema.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
+
+      - name: Download Security & Plan Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: .ci-artifacts
+
+      - name: Post Consolidated PR Comment
         uses: ./.github-templates/pipelines/common/bot
         with:
           github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
           mode: "plan"
-          environment: ${{ needs.detect.outputs.env }}
-          stack: ${{ matrix.stack }}
-          plan_exit_code: ${{ steps.tf_plan.outputs.exitcode }}
-          summary_report_path: ${{ steps.tf_plan.outputs.report_path }}
+          artifacts_dir: ".ci-artifacts"
+          environment: ${{ needs.parse-pr-metadata.outputs.env }}
+          cloud_provider: ${{ inputs.cloud_provider }}
+          stacks: ${{ needs.parse-pr-metadata.outputs.stacks }}
 
-  # -------------------------------------------------------------------
-  # 3. Merge Phase: Environment Gate + Terraform Apply + Audit Comment
-  # -------------------------------------------------------------------
-  apply:
-    name: Apply (${{ matrix.stack }} - ${{ needs.detect.outputs.env }})
-    needs: [detect]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect.outputs.skip_ci != 'true' && needs.detect.outputs.stacks != '[]'
+  # ===================================================================
+  # STAGE 3 (MERGE): Sequential Terraform Apply Behind Environment Gate
+  # ===================================================================
+  terraform-apply:
+    name: 3. Terraform Apply (${{ matrix.stack }})
+    needs: [parse-pr-metadata, validate-schema]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.parse-pr-metadata.outputs.stacks != '[]' && needs.validate-schema.result == 'success'
     runs-on: ubuntu-latest
-    environment: ${{ needs.detect.outputs.env }} # dev = auto | uat/prod = approval gate
+    environment: ${{ needs.parse-pr-metadata.outputs.env }}
     concurrency:
-      group: tf-apply-${{ inputs.cloud_provider }}-${{ needs.detect.outputs.env }}-${{ matrix.stack }}
+      group: tf-apply-${{ inputs.cloud_provider }}-${{ needs.parse-pr-metadata.outputs.env }}-${{ matrix.stack }}
       cancel-in-progress: false
     strategy:
       fail-fast: true
       max-parallel: 1
       matrix:
-        stack: ${{ fromJson(needs.detect.outputs.stacks) }}
+        stack: ${{ fromJson(needs.parse-pr-metadata.outputs.stacks) }}
     permissions:
       id-token: write
       contents: read
-      issues: write
-      pull-requests: write
     steps:
-      - name: Checkout Consumer Code
-        uses: actions/checkout@v4
-
-      - name: Checkout Centralized Templates
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: ${{ inputs.templates_repository }}
           ref: ${{ inputs.templates_ref }}
@@ -265,17 +478,50 @@ jobs:
         uses: ./.github-templates/pipelines/continuous-provisioning/terraform-apply
         with:
           cloud_provider: ${{ inputs.cloud_provider }}
-          environment: ${{ needs.detect.outputs.env }}
+          environment: ${{ needs.parse-pr-metadata.outputs.env }}
           working_directory: ${{ matrix.stack }}
-          config_file: ${{ needs.detect.outputs.config_file }}
+          config_file: ${{ needs.parse-pr-metadata.outputs.config_file }}
           state_bucket: ${{ inputs.state_bucket }}
 
-      - name: Record Deployment Audit Log
-        if: always()
+      - name: Upload Apply Outputs Artifact
+        if: always() && steps.tf_apply.outputs.report_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-outputs-${{ strategy.job-index }}
+          path: ${{ steps.tf_apply.outputs.report_path }}/
+          retention-days: 90
+          if-no-files-found: ignore
+
+  # ===================================================================
+  # STAGE 4 (MERGE): Consolidated CD Deployment Audit Bot
+  # ===================================================================
+  deployment-audit-bot:
+    name: 4. CD Deployment Audit Bot
+    needs: [parse-pr-metadata, validate-schema, terraform-apply]
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.parse-pr-metadata.outputs.skip_ci != 'true' && needs.validate-schema.result == 'success' && (needs.terraform-apply.result == 'success' || needs.terraform-apply.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.templates_repository }}
+          ref: ${{ inputs.templates_ref }}
+          path: .github-templates
+          fetch-depth: 1
+
+      - name: Download Apply Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: .cd-artifacts
+
+      - name: Post CD Deployment Audit Comment
         uses: ./.github-templates/pipelines/continuous-provisioning/deployment-audit
         with:
           github_token: ${{ secrets.BOT_GITHUB_TOKEN || github.token }}
-          environment: ${{ needs.detect.outputs.env }}
-          stack: ${{ matrix.stack }}
-          apply_status: ${{ steps.tf_apply.outcome }}
-          report_path: ${{ steps.tf_apply.outputs.report_path }}
+          artifacts_dir: ".cd-artifacts"
+          environment: ${{ needs.parse-pr-metadata.outputs.env }}
+          cloud_provider: ${{ inputs.cloud_provider }}
+          state_bucket: ${{ inputs.state_bucket }}

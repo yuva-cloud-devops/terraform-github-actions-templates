@@ -1,5 +1,5 @@
 name: "Terraform Plan"
-description: "Generates backend.hcl dynamically and computes Terraform plan with resilient error capture"
+description: "Generates backend.hcl dynamically and computes Terraform plan with JSON and artifact metadata"
 inputs:
   cloud_provider:
     required: true
@@ -16,18 +16,23 @@ inputs:
     description: "Optional state bucket name override"
     required: false
     default: ""
+  skip_fmt_validate:
+    description: "Skip fmt and standalone validate when already executed by prior jobs"
+    required: false
+    default: "false"
 outputs:
   exitcode:
     description: "Terraform plan exit code"
     value: ${{ steps.plan.outputs.exitcode }}
   report_path:
-    description: "Path to formatted markdown plan report"
-    value: ${{ steps.report.outputs.report_path }}
+    description: "Path to plan metadata directory"
+    value: ${{ steps.plan.outputs.artifact_dir }}
 
 runs:
   using: "composite"
   steps:
     - name: Terraform Format Check
+      if: inputs.skip_fmt_validate != 'true'
       shell: bash
       working-directory: ${{ inputs.working_directory }}
       run: |
@@ -54,6 +59,7 @@ runs:
             export TF_VAR_config_file="$(pwd)/environments/${ENV}/${CONFIG_FILE_INPUT}"
           fi
         fi
+
         if [ "$STACK_PATH" = "." ] || [ -z "$STACK_PATH" ]; then
           STACK_NAME=$(basename "$(pwd)")
         else
@@ -91,7 +97,7 @@ runs:
             echo "::error::Unsupported cloud provider: $CLOUD" | tee plan.txt
             echo "exitcode=1" >> "$GITHUB_OUTPUT"
             echo "{}" > tfplan.json
-            exit 0
+            exit 1
             ;;
         esac
 
@@ -99,72 +105,63 @@ runs:
         cat backend.hcl
         echo "================================================================="
 
+        FINAL_EXIT=0
         terraform init -input=false -reconfigure -backend-config=backend.hcl > plan.txt 2>&1
         INIT_EXIT=$?
         if [ $INIT_EXIT -ne 0 ]; then
           cat plan.txt
           echo "::error::Terraform init failed with exit code $INIT_EXIT"
-          echo "exitcode=1" >> "$GITHUB_OUTPUT"
+          FINAL_EXIT=1
           echo "{}" > tfplan.json
-          exit 0
-        fi
-
-        terraform validate -no-color >> plan.txt 2>&1
-        VAL_EXIT=$?
-        if [ $VAL_EXIT -ne 0 ]; then
-          cat plan.txt
-          echo "::error::Terraform validate failed with exit code $VAL_EXIT"
-          echo "exitcode=1" >> "$GITHUB_OUTPUT"
-          echo "{}" > tfplan.json
-          exit 0
-        fi
-
-        EXTRA_ARGS=""
-        if [ -f "environments/${ENV}.tfvars" ]; then
-          EXTRA_ARGS="-var-file=environments/${ENV}.tfvars"
-        elif [ -f "environments/${ENV}.tfvars.json" ]; then
-          EXTRA_ARGS="-var-file=environments/${ENV}.tfvars.json"
-        fi
-
-        terraform plan -input=false -detailed-exitcode -no-color -out=tfplan $EXTRA_ARGS > plan.txt 2>&1
-        PLAN_EXIT=$?
-        cat plan.txt
-        echo "exitcode=$PLAN_EXIT" >> "$GITHUB_OUTPUT"
-
-        if [ $PLAN_EXIT -eq 0 ] || [ $PLAN_EXIT -eq 2 ]; then
-          terraform show -json tfplan > tfplan.json 2>/dev/null || echo "{}" > tfplan.json
         else
-          echo "{}" > tfplan.json
-          echo "::error::Terraform plan failed with exit code $PLAN_EXIT"
+          terraform validate -no-color >> plan.txt 2>&1
+          VAL_EXIT=$?
+          if [ $VAL_EXIT -ne 0 ]; then
+            cat plan.txt
+            echo "::error::Terraform validate failed with exit code $VAL_EXIT"
+            FINAL_EXIT=1
+            echo "{}" > tfplan.json
+          else
+            EXTRA_ARGS=""
+            if [ -f "environments/${ENV}.tfvars" ]; then
+              EXTRA_ARGS="-var-file=environments/${ENV}.tfvars"
+            elif [ -f "environments/${ENV}.tfvars.json" ]; then
+              EXTRA_ARGS="-var-file=environments/${ENV}.tfvars.json"
+            fi
+
+            terraform plan -input=false -detailed-exitcode -no-color -out=tfplan $EXTRA_ARGS > plan.txt 2>&1
+            PLAN_EXIT=$?
+            cat plan.txt
+            FINAL_EXIT=$PLAN_EXIT
+
+            if [ $PLAN_EXIT -eq 0 ] || [ $PLAN_EXIT -eq 2 ]; then
+              terraform show -json tfplan > tfplan.json 2>/dev/null || echo "{}" > tfplan.json
+            else
+              echo "{}" > tfplan.json
+              echo "::error::Terraform plan failed with exit code $PLAN_EXIT"
+            fi
+          fi
         fi
+
+        mkdir -p .tf-plan-out
+        cp tfplan.json .tf-plan-out/tfplan.json
+        cp plan.txt .tf-plan-out/plan.txt
+        cp backend.hcl .tf-plan-out/backend.hcl
+        STACK_NAME="$STACK_NAME" FINAL_EXIT="$FINAL_EXIT" node -e '
+          const fs = require("fs");
+          fs.writeFileSync(".tf-plan-out/meta.json", JSON.stringify({
+            stack: process.env.STACK_NAME,
+            dir: process.env.STACK_PATH,
+            env: process.env.ENV,
+            cloud: process.env.CLOUD,
+            exitcode: Number(process.env.FINAL_EXIT)
+          }, null, 2));
+        '
+
+        echo "exitcode=$FINAL_EXIT" >> "$GITHUB_OUTPUT"
+        echo "artifact_dir=$(pwd)/.tf-plan-out" >> "$GITHUB_OUTPUT"
         set -e
 
-    - name: Generate Plan Markdown Report
-      id: report
-      if: always()
-      shell: bash
-      working-directory: ${{ inputs.working_directory }}
-      env:
-        PLAN_EXIT: ${{ steps.plan.outputs.exitcode }}
-        STACK_PATH: ${{ inputs.working_directory }}
-      run: |
-        GEN_SCRIPT="${{ github.action_path }}/../../../scripts/generate-plan-report.js"
-        if [ ! -f "$GEN_SCRIPT" ]; then
-          GEN_SCRIPT=".github-templates/scripts/generate-plan-report.js"
-        fi
-
-        node "$GEN_SCRIPT" \
-          --json tfplan.json \
-          --raw plan.txt \
-          --env "${{ inputs.environment }}" \
-          --cloud "${{ inputs.cloud_provider }}" \
-          --stack "${STACK_PATH}" \
-          --exitcode "${PLAN_EXIT:-1}" \
-          --out plan-report.md
-
-        echo "report_path=$(pwd)/plan-report.md" >> "$GITHUB_OUTPUT"
-
-        if [ "${PLAN_EXIT:-1}" -eq 1 ]; then
-          echo "::error::Failing step because Terraform init/validate/plan produced errors."
+        if [ "$FINAL_EXIT" -eq 1 ]; then
           exit 1
         fi
